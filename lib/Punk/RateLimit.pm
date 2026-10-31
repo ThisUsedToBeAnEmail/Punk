@@ -1,0 +1,113 @@
+package Punk::RateLimit;
+
+use strict;
+use warnings;
+
+our $VERSION = '0.67';
+
+
+1;
+
+__END__
+
+=head1 NAME
+
+Punk::RateLimit - rate limiting and IP blocking over Hyperman's shared arena
+
+=head1 SYNOPSIS
+
+    use Punk;
+
+    # a loose limit on everything, keyed by client IP
+    rate_limit limit => 300, window => 60;
+
+    # a tighter one on the API, keyed by an API-key header
+    rate_limit for => '/api', by => 'header:X-Api-Key',
+               limit => 60, window => 60, tag => 'api';
+
+    # or a custom identity
+    rate_limit by => sub { my ($c) = @_; $c->session->{user} }, limit => 20;
+
+    # block an abuser from a handler; the edge drops it next time
+    post '/login' => sub {
+        my ($c) = @_;
+        if (too_many_failures($c)) { $c->block_ip(undef, 3600); }
+        ...
+    };
+
+=head1 DESCRIPTION
+
+C<rate_limit> installs a before_dispatch that answers B<429 Too Many Requests>
+(with C<Retry-After> and the C<X-RateLimit-*> headers) when a caller exceeds
+the limit for the rule. The counters live in Hyperman's shared arena, mapped
+before its workers fork, so a limit is exact across the whole pool rather than
+per worker. It is C<by> the client IP by default; C<< by => 'header:NAME' >>
+keys on a request header, and C<< by => sub { ... } >> on whatever the coderef
+returns for a context. C<for> scopes a rule to a path prefix, C<tag> names its
+counter namespace. Declare it more than once for layered limits.
+
+A header rule counts a request that carries no such header against the
+client address instead, so leaving the header off is not a way around the
+rule. An id longer than 256 bytes is cut to 256 before it becomes a key.
+
+The arena's rate table holds 4096 live keys across every rule of every
+application on it. When it is full, Hyperman lets a request with a new key
+through rather than refuse it, and this plugin cannot tell that from a first
+hit. A rule keyed on a header or a coderef value that a client chooses can
+therefore fill the table with keys of its own and switch every rule off for
+the rest of the window. Key such rules on something the client cannot mint
+freely, and keep the sensitive limits (C</login>) on the address.
+
+A route may also carry a budget of its own:
+
+    post '/login' => 'Web::Auth#login', { rate_limit => 5 };
+
+That is the same enforcement, installed as a guard on one route instead of a
+hook over a prefix, with the counter namespaced to the route unless a C<tag>
+says otherwise. It is the right shape for the routes an attacker retries -
+C</login>, C</register>, C</forgot> - which a prefix rule cannot single out.
+See L<Punk/A budget for one route>.
+
+Blocking is separate and cheaper: C<< $c->block_ip($ip, $ttl) >> adds an IP to
+the same arena's denylist, and Hyperman drops it at C<accept> - before a byte
+is read - on its next connection. C<< $c->unblock_ip($ip) >> lifts it. Both
+default C<$ip> to the current request's C<REMOTE_ADDR>. C<< $c->rate_hit($key,
+$limit, $window) >> is the raw counter check, returning
+C<($ok, $remaining, $reset)>.
+
+Everything B<fails open>: with no Hyperman E<gt>= ABI v3 under the application
+the limiter allows every request and blocking is a no-op, so it is never the
+reason a good request is refused.
+
+=head1 BEHIND A REVERSE PROXY
+
+B<If this application runs behind nginx, an ELB or a CDN, declare
+L<Punk/proxy> or the limiter is wrong in a way that will take the site
+down.>
+
+The exactness above is what makes it dangerous. C<REMOTE_ADDR> behind a
+proxy is the I<proxy's> address on every request, and because the counter is
+shared across the whole worker pool rather than per worker, every client on
+the internet lands in B<one bucket>: a C<< limit =E<gt> 100 >> rule then
+throttles the entire site at 100 per window, and C<< $c-E<gt>block_ip >>
+bans the load balancer.
+
+    use Punk;
+    proxy;                                  # one proxy in front
+    rate_limit limit => 100, window => 60;   # now keyed on the real client
+
+Do not reach for C<< by =E<gt> 'header:X-Forwarded-For' >> instead. Nothing
+validates that header, so on an application that is not actually behind a
+proxy any client can set it and step into a fresh bucket at will - a bypass
+in place of a shared bucket. L<Punk/proxy> validates the hop chain; this
+does not.
+
+Note also that once a proxy is in front, C<< $c-E<gt>block_ip >> can no
+longer be enforced at C<accept>: the edge sees only the proxy, so the ban
+becomes a C<403> at dispatch. Same outcome, one request's worth of cost.
+
+=head1 SEE ALSO
+
+L<Punk>, L<Punk/proxy>, L<Hyperman>.
+
+=cut

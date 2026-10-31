@@ -1,0 +1,166 @@
+package Punk::WebSocket;
+
+use 5.010;
+use strict;
+use warnings;
+use Punk ();
+
+our $VERSION = '0.67';
+
+1;
+
+__END__
+
+=head1 NAME
+
+Punk::WebSocket - a WebSocket connection
+
+=head1 SYNOPSIS
+
+    # in the app
+    websocket '/chat' => 'WS::Chat#join';
+
+    # MyApp::Controller::WS::Chat
+    sub join {
+        my ($c, $ws) = @_;               # after a validated upgrade
+
+        $ws->on(open => sub {
+            my ($ws) = @_;
+            Punk::WebSocket::Room->named('lobby')->join($ws);
+        });
+        $ws->on(message => sub {
+            my ($ws, $text) = @_;
+            Punk::WebSocket::Room->named('lobby')->broadcast($text);
+        });
+        $ws->on(close => sub {
+            my ($ws, $code, $reason) = @_;
+            Punk::WebSocket::Room->named('lobby')->leave($ws);
+        });
+    }
+
+=head1 DESCRIPTION
+
+One WebSocket connection. The handler for a C<websocket> route is called
+with the L<Punk::Context> and this object once the upgrade handshake has
+been validated and answered; it wires the events it cares about and
+returns. Reading, framing, ping/pong and the closing handshake then run
+on the worker's event loop with no further Perl involvement until a
+message completes.
+
+The upgrade is refused before any of that when its C<Origin> is not one
+the application answers as - see L<Punk/Which origins may open a socket>,
+which is also where the C<origin> route option is described. The rule
+matters more here than anywhere else in an application: the same-origin
+policy does not cover this request, so nothing but this check stands
+between a page on another site and an authenticated socket.
+
+The same route works on every transport, and the codec above is identical
+on all of them; only the handshake underneath differs. Plaintext HTTP/1.1
+hands the socket over to the worker loop. HTTP/1.1 over TLS cannot - an
+OpenSSL session's state belongs to the server, not the socket - so the
+upgrade opens a 101 stream handle and the frames travel through the TLS
+session; this needs Hyperman 0.48 or newer. HTTP/2 and HTTP/3 have no 101
+at all: the upgrade is an Extended CONNECT (RFC 8441 / RFC 9220) that the
+server accepts by opening a stream, and a browser uses it for every
+WebSocket once the server has advertised the setting.
+
+An Extended CONNECT is answered by a C<websocket> route and by nothing
+else. It is matched as the GET the route is registered under, and a match
+that is not a websocket route is a 404 - the same 404 for a path with no
+route at all, for a path that is a route only under another method, and
+for a path under an C<api> or a C<mount> prefix. On this transport a 2xx
+is the acceptance, so an upgrade allowed to reach an ordinary handler
+would hand any page anywhere that handler's status. One consequence worth
+knowing: a mounted application's own websocket routes are not reachable
+over HTTP/2 or HTTP/3, because a mount answers for itself and never comes
+back past the check.
+
+Frames are decoded in C to RFC 6455, strictly: unmasked client frames,
+fragmented or over-long control frames and reserved opcodes are protocol
+errors (close 1002), text payloads and close reasons must be valid UTF-8
+(1007), and a message over C<max_message_size> is refused from the frame
+header before it is buffered (1009). A C<max_message_size> of zero means the
+default, 16MB; there is no setting that removes the bound.
+
+=head1 EVENTS
+
+C<< $ws->on($event => sub { ... }) >>, one handler per event; an unknown
+event name croaks. Every handler receives the connection first.
+
+=over 4
+
+=item * B<open> C<< ($ws) >> - the handshake is complete.
+
+=item * B<message> C<< ($ws, $text) >> - a complete text message,
+character-decoded.
+
+=item * B<binary> C<< ($ws, $bytes) >> - a complete binary message.
+
+=item * B<ping> C<< ($ws, $payload) >> / B<pong> C<< ($ws, $payload) >> -
+a pong is sent automatically before the ping event fires.
+
+=item * B<close> C<< ($ws, $code, $reason) >> - fires exactly once, for a
+clean close or a dropped connection (code 1006).
+
+=item * B<error> C<< ($ws, $message) >> - a handler died, or the codec
+rejected the peer's framing.
+
+=back
+
+A handler that dies does not take the worker down: the error event fires
+and the connection is closed with 1011.
+
+=head1 METHODS
+
+=head2 on($event, $code)
+
+Sets the handler for C<$event>, replacing any earlier one; see L</EVENTS>.
+Croaks on an unknown event or a C<$code> that is not a code reference.
+Chainable.
+
+=head2 send($text)
+
+=head2 send_binary($bytes)
+
+Queue a message. Writes are buffered and drained on the loop, so a slow
+consumer never blocks the worker (past C<write_buffer_limit> the
+connection is closed with 1008).
+
+=head2 ping($payload?)
+
+=head2 pong($payload?)
+
+=head2 close($code = 1000, $reason = '')
+
+Start the closing handshake; the C<close> event fires when it completes
+or times out. The code must be one a peer may be sent (1000 to 1003, 1007
+to 1011, or 3000 to 4999); anything else croaks rather than go on the wire
+as whatever its low sixteen bits say.
+
+=head2 state / is_open / is_closing / is_closed
+
+=head2 protocol
+
+The negotiated subprotocol, or undef.
+
+=head2 fd
+
+The underlying file descriptor.
+
+=head1 SEE ALSO
+
+L<Punk>, L<Punk::WebSocket::Room>, L<Hyperman/detach>.
+
+=head1 AUTHOR
+
+LNATION <email@lnation.org>
+
+=head1 LICENSE AND COPYRIGHT
+
+This software is Copyright (c) 2026 by LNATION <email@lnation.org>.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

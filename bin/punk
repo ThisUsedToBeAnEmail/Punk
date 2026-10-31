@@ -1,0 +1,79 @@
+#!/usr/bin/env perl
+
+use 5.010;
+use strict;
+use warnings;
+use Punk::Command;
+
+# Everything - the registry, the dispatcher, option parsing, generated help -
+# lives in Punk::Command, where it is testable in-process. The version this
+# prints is $Punk::VERSION and nothing else, so it cannot skew.
+
+exit Punk::Command->main(@ARGV);
+
+__END__
+
+=head1 NAME
+
+punk - the Punk command line
+
+=head1 SYNOPSIS
+
+    punk new MyApp              # generate a new application
+    punk new MyApp --kit diy    # ...or a whole one, from an installed kit
+    punk routes                 # the compiled routing table
+    punk api sync               # stubs for operations added to the spec
+    punk config check           # resolve configuration and every secret
+    punk doctor                 # versions, C ABIs, application health
+    punk console                # a REPL with the application compiled
+    punk dev                    # Hyperman with restart-on-change
+    punk serve ./public         # a directory of files, no application
+    punk help [command]         # generated from each command's declaration
+
+=head1 DESCRIPTION
+
+The command line for L<Punk> applications. Except for C<new> and C<serve>,
+every command finds the application by walking up from the current directory
+looking for F<app.psgi>, and takes the class from that file's
+C<< Class->to_app >>.
+
+Help is generated from each command's declared options, so C<punk help X>
+and C<punk X --help> always match what the command actually accepts. Exit
+codes: 0 success, 1 something is wrong with the application or its
+environment, 2 the command was used wrongly.
+
+Commands live in L<Punk::Command>, which also documents how a plugin
+distribution adds its own subcommand.
+
+=head1 KITS
+
+C<punk new MyApp --kit NAME> generates through C<Punk::Kit::E<lt>NameE<gt>>
+instead of the basic skeleton - a distribution's own generator, handing you
+a whole working application rather than a welcome page. A kit brings its own
+options, which C<punk new --kit NAME --help> lists under the command's.
+
+Kits ship in their own distributions; L<Punk::Generate/KITS> is how one is
+written.
+
+=head1 ENVIRONMENT
+
+C<PUNK_ENV> selects the environment (production when unset). C<punk dev>
+sets it to C<development> for the server it runs unless already set.
+
+=head1 SEE ALSO
+
+L<Punk>, L<Punk::Command>, L<Punk::Generate>.
+
+=head1 AUTHOR
+
+LNATION <email@lnation.org>
+
+=head1 LICENSE AND COPYRIGHT
+
+This software is Copyright (c) 2026 by LNATION <email@lnation.org>.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

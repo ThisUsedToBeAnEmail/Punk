@@ -1,0 +1,445 @@
+#!perl
+use 5.010;
+use strict;
+use warnings;
+use FindBin ();
+use lib "$FindBin::Bin/lib";
+use Test::More;
+use IO::Socket::INET;
+use Time::HiRes ();
+use PunkWSRef qw(encode_client decode_ref accept_key handshake_request);
+
+# WebSockets end to end: a real Punk app on a real Hyperman worker, driven
+# by the independent reference codec in t/lib. Covers the upgrade
+# handshake and its rejections, echo, rooms, ping/pong, the closing
+# handshake, guards running before the upgrade, and the worker staying
+# healthy for ordinary HTTP throughout.
+
+BEGIN {
+    eval { require Hyperman; 1 }
+        or plan skip_all => 'Hyperman required for these tests';
+    eval { require Punk::WebSocket; 1 }
+        or plan skip_all => 'Punk::WebSocket unavailable';
+    plan skip_all => 'Hyperman 0.11+ (the detach ABI) required'
+        unless Punk::WebSocket::_hm_available();
+}
+
+my $port = 25300 + ($$ % 300);
+my $host = "127.0.0.1:$port";
+
+my $pid = fork // die "fork: $!";
+if (!$pid) {
+    open STDERR, '>', '/dev/null';
+    require Punk::WebSocket::Room;
+
+    package WSApp;
+    use Punk;
+
+    websocket '/echo' => sub {
+        my ($c, $ws) = @_;
+        $ws->on(message => sub { $_[0]->send("echo:$_[1]") });
+        $ws->on(binary  => sub { $_[0]->send_binary("bin:$_[1]") });
+        $ws->on(ping    => sub { });      # the pong is automatic
+    };
+
+    # answers one message only: the rest is read and dropped
+    websocket '/sink' => sub {
+        my ($c, $ws) = @_;
+        $ws->on(message => sub { $_[0]->send('pong') if $_[1] eq 'ping-me' });
+    };
+
+    websocket '/chat' => sub {
+        my ($c, $ws) = @_;
+        my $room = Punk::WebSocket::Room->named('lobby');
+        $ws->on(open    => sub { $room->join($_[0]) });
+        $ws->on(message => sub { $room->broadcast("said:$_[1]") });
+        $ws->on(close   => sub { $room->leave($_[0]) });
+    };
+
+    # The two room methods nothing exercised: a binary broadcast, and closing
+    # every member at once. A text broadcast is covered above, and these two
+    # are the ones where "it returned a plausible number" is indistinguishable
+    # from working.
+    websocket '/room2' => sub {
+        my ($c, $ws) = @_;
+        my $room = Punk::WebSocket::Room->named('room2');
+        $ws->on(open => sub { $room->join($_[0]) });
+        $ws->on(message => sub {
+            my ($conn, $msg) = @_;
+            if ($msg eq 'bin') {
+                my $n = $room->broadcast_binary("\x00\x01\xfe\xff");
+                $conn->send("sent:$n");
+            }
+            elsif ($msg eq 'bin-except') {
+                my $n = $room->broadcast_binary("\x00\x01\xfe\xff", $conn);
+                $conn->send("sent:$n");
+            }
+            elsif ($msg eq 'shut') {
+                $room->close_all(4001, 'closing time');
+            }
+            elsif ($msg eq 'size') { $conn->send("size:" . $room->count) }
+            # fd: the descriptor underneath, which is what a server writes to
+            elsif ($msg eq 'fd')   { $conn->send('fd:' . ($conn->fd // 'undef')) }
+        });
+        $ws->on(close => sub { $room->leave($_[0]) });
+    };
+
+    websocket '/any' => sub {
+        my ($c, $ws) = @_;
+        $ws->on(message => sub { $_[0]->send('any ok') });
+    }, { origin => 0 };
+
+    websocket '/proto' => sub {
+        my ($c, $ws) = @_;
+        $ws->on(message => sub { $_[0]->send('proto:' . ($_[0]->protocol // '-')) });
+    }, { protocols => [ 'chat.v2', 'chat.v1' ] };
+
+    my $guarded = under '/private' => sub {
+        my ($c) = @_;
+        return $c->text('nope', 403)
+            unless ($c->req->header('x-token') // '') eq 'let-me-in';
+        return;
+    };
+    $guarded->websocket('/ws' => sub {
+        my ($c, $ws) = @_;
+        $ws->on(message => sub { $_[0]->send('guarded ok') });
+    });
+
+    get '/plain' => sub { $_[0]->text('plain ok') };
+
+    package main;
+    Hyperman->run(app => WSApp->to_app, host => '127.0.0.1',
+                  port => $port, workers => 1);
+    exit 0;
+}
+
+for (1 .. 60) {
+    my $s = IO::Socket::INET->new(PeerAddr => $host);
+    last if $s;
+    Time::HiRes::sleep(0.1);
+}
+
+sub sock {
+    my $s = IO::Socket::INET->new(PeerAddr => $host) or die "connect: $!";
+    $s->autoflush(1);
+    return $s;
+}
+
+# Read until a full HTTP header block has arrived.
+sub read_headers {
+    my ($s) = @_;
+    my $buf = '';
+    eval {
+        local $SIG{ALRM} = sub { die "timeout\n" };
+        alarm 5;
+        while (sysread $s, my $c, 1) {
+            $buf .= $c;
+            last if $buf =~ /\r\n\r\n\z/;
+        }
+        alarm 0;
+    };
+    return $buf;
+}
+
+# Open a connection and complete the handshake; returns (socket, headers).
+sub ws_connect {
+    my (%a) = @_;
+    my $s = sock();
+    my ($req, $key) = handshake_request(host => $host, %a);
+    syswrite $s, $req;
+    my $hdr = read_headers($s);
+    return ($s, $hdr, $key);
+}
+
+# Read one frame off the wire. Two server frames can arrive in one TCP
+# segment (broadcast_binary's frame and the sent:N reply do, on a slow
+# box), so keep what follows the decoded frame on the socket for the
+# next call instead of discarding it.
+sub read_frame {
+    my ($s) = @_;
+    my $buf = \${*$s}{ws_buf};
+    $$buf //= '';
+    my $f;
+    eval {
+        local $SIG{ALRM} = sub { die "timeout\n" };
+        alarm 5;
+        while (1) {
+            $f = decode_ref($$buf);
+            last if $f && ref $f;
+            my $n = sysread $s, my $c, 4096;
+            last unless $n;
+            $$buf .= $c;
+        }
+        alarm 0;
+    };
+    return undef unless ref $f;
+    substr $$buf, 0, $f->{consumed}, '';
+    return $f;
+}
+
+sub http_get {
+    my ($path) = @_;
+    my $s = sock();
+    syswrite $s, "GET $path HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    my $buf = '';
+    eval {
+        local $SIG{ALRM} = sub { die "timeout\n" };
+        alarm 5;
+        while (my $n = sysread $s, my $c, 4096) { $buf .= $c }
+        alarm 0;
+    };
+    return $buf;
+}
+
+# ---- the handshake ---------------------------------------------------------
+{
+    my ($s, $hdr, $key) = ws_connect(path => '/echo');
+    like($hdr, qr{\AHTTP/1\.1 101 Switching Protocols\r\n},
+        'the upgrade is answered with a real 101');
+    like($hdr, qr/Upgrade: websocket/i, 'Upgrade header');
+    like($hdr, qr/Connection: Upgrade/i, 'Connection header');
+    my ($acc) = $hdr =~ /Sec-WebSocket-Accept: (\S+)/i;
+    is($acc, accept_key($key), 'Sec-WebSocket-Accept is the RFC 6455 digest');
+    close $s;
+}
+
+# ---- echo, binary, ping/pong, close ---------------------------------------
+{
+    my ($s) = ws_connect(path => '/echo');
+
+    syswrite $s, encode_client(opcode => 1, payload => 'hello');
+    my $f = read_frame($s);
+    is($f->{opcode}, 1, 'a text frame comes back');
+    is($f->{payload}, 'echo:hello', 'echoed through the handler');
+    is($f->{masked}, 0, 'server frames are not masked');
+
+    syswrite $s, encode_client(opcode => 2, payload => 'raw');
+    $f = read_frame($s);
+    is($f->{opcode}, 2, 'binary stays binary');
+    is($f->{payload}, 'bin:raw', 'binary handler ran');
+
+    syswrite $s, encode_client(opcode => 9, payload => 'hi');
+    $f = read_frame($s);
+    is($f->{opcode}, 10, 'a ping is answered with a pong');
+    is($f->{payload}, 'hi', 'the pong echoes the ping payload');
+
+    # a fragmented text message
+    syswrite $s, encode_client(opcode => 1, fin => 0, payload => 'frag');
+    syswrite $s, encode_client(opcode => 0, fin => 1, payload => 'ment');
+    $f = read_frame($s);
+    is($f->{payload}, 'echo:fragment', 'fragments reassemble into one message');
+
+    # clean close: the server echoes it
+    syswrite $s, encode_client(opcode => 8, payload => pack('n', 1000) . 'bye');
+    $f = read_frame($s);
+    is($f->{opcode}, 8, 'the close is echoed');
+    is(unpack('n', substr $f->{payload}, 0, 2), 1000, 'with the same code');
+    close $s;
+}
+
+# ---- utf8 and protocol violations close with the right codes ---------------
+{
+    my ($s) = ws_connect(path => '/echo');
+    syswrite $s, encode_client(opcode => 1, payload => "bad \xff\xfe utf8");
+    my $f = read_frame($s);
+    is($f->{opcode}, 8, 'invalid utf8 in a text frame closes the connection');
+    is(unpack('n', substr $f->{payload}, 0, 2), 1007, 'with close code 1007');
+    close $s;
+}
+{
+    my ($s) = ws_connect(path => '/echo');
+    # an unmasked client frame is a protocol error
+    syswrite $s, PunkWSRef::encode_server(opcode => 1, payload => 'nope');
+    my $f = read_frame($s);
+    is($f->{opcode}, 8, 'an unmasked client frame closes the connection');
+    is(unpack('n', substr $f->{payload}, 0, 2), 1002, 'with close code 1002');
+    close $s;
+}
+
+# ---- rooms -----------------------------------------------------------------
+{
+    my ($a) = ws_connect(path => '/chat');
+    my ($b) = ws_connect(path => '/chat');
+    Time::HiRes::sleep(0.2);        # let both opens land
+
+    syswrite $a, encode_client(opcode => 1, payload => 'hey');
+    my $to_a = read_frame($a);
+    my $to_b = read_frame($b);
+    is($to_a->{payload}, 'said:hey', 'the sender sees the broadcast');
+    is($to_b->{payload}, 'said:hey', 'the other member sees it too');
+    close $a;
+    close $b;
+}
+
+# ---- broadcast_binary, and close_all ---------------------------------------
+# Both documented, neither executed until now. They are the pair where a
+# plausible return value hides a wrong result: broadcast_binary reports how
+# many it sent whether or not the frames were binary, and close_all reports
+# nothing at all.
+{
+    my ($a) = ws_connect(path => '/room2');
+    my ($b) = ws_connect(path => '/room2');
+    Time::HiRes::sleep(0.2);
+
+    syswrite $a, encode_client(opcode => 1, payload => 'bin');
+    my $fa = read_frame($a);
+    my $fb = read_frame($b);
+
+    is($fa->{opcode}, 2, 'broadcast_binary sends a BINARY frame, not text');
+    is($fa->{payload}, "\x00\x01\xfe\xff",
+        'carrying bytes that are not valid utf8 - which a text frame could '
+      . 'not have delivered at all');
+    is($fb->{opcode}, 2, 'to every member');
+    is($fb->{payload}, "\x00\x01\xfe\xff", 'with the same bytes');
+
+    my $count = read_frame($a);
+    is($count->{payload}, 'sent:2', 'and reports how many it sent');
+
+    # the `except` argument, usually the sender
+    syswrite $a, encode_client(opcode => 1, payload => 'bin-except');
+    my $skip = read_frame($a);
+    is($skip->{payload}, 'sent:1',
+        'the except argument drops one recipient from the count');
+    is(read_frame($b)->{opcode}, 2, 'and the other member still got it');
+
+    # close_all: every member gets a close frame carrying the code and reason
+    syswrite $a, encode_client(opcode => 1, payload => 'shut');
+    my $ca = read_frame($a);
+    my $cb = read_frame($b);
+    is($ca->{opcode}, 8, 'close_all closes the sender');
+    is(unpack('n', substr $ca->{payload}, 0, 2), 4001, 'with the given code');
+    is(substr($ca->{payload}, 2), 'closing time', 'and the given reason');
+    is($cb->{opcode}, 8, 'and every other member too');
+    close $a;
+    close $b;
+
+    # and the room is empty afterwards, which is what separates close_all
+    # from closing each connection by hand
+    my ($cc) = ws_connect(path => '/room2');
+    Time::HiRes::sleep(0.2);
+    syswrite $cc, encode_client(opcode => 1, payload => 'size');
+    is(read_frame($cc)->{payload}, 'size:1',
+        'the room is empty after close_all - a fresh member is the only one');
+
+    # fd: the descriptor underneath a live connection. Documented, never read.
+    syswrite $cc, encode_client(opcode => 1, payload => 'fd');
+    my $fd = read_frame($cc)->{payload};
+    like($fd, qr/^fd:\d+$/,
+        'a live connection reports the descriptor a server would write to');
+    cmp_ok((split /:/, $fd)[1], '>=', 0, 'which is a real one');
+    close $cc;
+}
+
+# ---- subprotocol negotiation ------------------------------------------------
+{
+    my ($s, $hdr) = ws_connect(path => '/proto', protocol => 'chat.v1, x.y');
+    like($hdr, qr/Sec-WebSocket-Protocol: chat\.v1/i,
+        'the offered subprotocol the route supports is selected');
+    syswrite $s, encode_client(opcode => 1, payload => 'q');
+    is(read_frame($s)->{payload}, 'proto:chat.v1',
+        'and reaches the handler');
+    close $s;
+
+    my ($s2, $hdr2) = ws_connect(path => '/proto', protocol => 'nope.v9');
+    like($hdr2, qr{\AHTTP/1\.1 400}, 'an unsupported subprotocol is a 400');
+    close $s2;
+}
+
+# ---- the Origin check, on the wire ------------------------------------------
+#
+# t/1012-ws-origin.t covers the rules; this is the proof that a real browser's
+# handshake is refused by a real server before the socket is ever detached.
+{
+    my ($s, $hdr) = ws_connect(path => '/echo',
+                               extra => [ 'Origin: http://evil.example' ]);
+    like($hdr, qr{\AHTTP/1\.1 403}, 'a cross-origin upgrade is refused');
+    close $s;
+
+    my ($s2, $hdr2) = ws_connect(path => '/echo',
+                                 extra => [ "Origin: http://$host" ]);
+    like($hdr2, qr{\AHTTP/1\.1 101},
+        'and the page this application served is not');
+    close $s2;
+
+    my ($s3, $hdr3) = ws_connect(path => '/any',
+                                 extra => [ 'Origin: http://evil.example' ]);
+    like($hdr3, qr{\AHTTP/1\.1 101}, 'origin => 0 opens the socket to anyone');
+    close $s3;
+}
+
+# ---- handshake rejections ---------------------------------------------------
+{
+    my ($s, $hdr) = ws_connect(path => '/echo', version => 8);
+    like($hdr, qr{\AHTTP/1\.1 426}, 'a wrong version is a 426');
+    like($hdr, qr/Sec-WebSocket-Version: 13/i, 'advertising version 13');
+    close $s;
+}
+{
+    my ($s, $hdr) = ws_connect(path => '/echo', key => '');
+    like($hdr, qr{\AHTTP/1\.1 400}, 'a missing key is a 400');
+    close $s;
+}
+{
+    my $s = sock();
+    syswrite $s, "GET /echo HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n";
+    like(read_headers($s), qr{\AHTTP/1\.1 400},
+        'a plain GET on a websocket route is a 400');
+    close $s;
+}
+
+# ---- guards run before the upgrade -----------------------------------------
+{
+    my ($s, $hdr) = ws_connect(path => '/private/ws');
+    like($hdr, qr{\AHTTP/1\.1 403},
+        'a guard rejects with an ordinary HTTP response, pre-upgrade');
+    close $s;
+
+    my ($s2, $hdr2) = ws_connect(path => '/private/ws',
+        extra => [ 'X-Token: let-me-in' ]);
+    like($hdr2, qr{\AHTTP/1\.1 101}, 'and lets an authorised client upgrade');
+    syswrite $s2, encode_client(opcode => 1, payload => 'x');
+    is(read_frame($s2)->{payload}, 'guarded ok', 'the guarded socket works');
+    close $s2;
+}
+
+# ---- one loud client does not own the worker ---------------------------------
+# The read loop used to run until the socket was empty. A client that kept
+# its socket full was read and processed until it stopped, and every other
+# connection on the worker waited for it (2.2 s measured for this reply).
+{
+    my ($a) = ws_connect(path => '/sink');
+    my ($b) = ws_connect(path => '/sink');
+    my $child = fork // die "fork: $!";
+    if (!$child) {
+        my $buf = encode_client(opcode => 1, payload => 'x') x 100_000;
+        my $end = time + 2;
+        while (time < $end) { syswrite $a, $buf or last }
+        require POSIX; POSIX::_exit(0);
+    }
+    select undef, undef, undef, 0.3;
+    my $t0 = Time::HiRes::time();
+    syswrite $b, encode_client(opcode => 1, payload => 'ping-me');
+    my $f  = read_frame($b);
+    my $dt = Time::HiRes::time() - $t0;
+    waitpid $child, 0;
+    is($f && $f->{payload}, 'pong', 'the quiet client was answered');
+    cmp_ok($dt, '<', 1.0, sprintf 'in %.3fs, while another client kept its socket full', $dt);
+    close $a; close $b;
+}
+
+# ---- ordinary HTTP is unaffected throughout ---------------------------------
+{
+    my ($held) = ws_connect(path => '/echo');
+    like(http_get('/plain'), qr/plain ok/,
+        'plain routes serve while a websocket is open');
+    syswrite $held, encode_client(opcode => 1, payload => 'still');
+    is(read_frame($held)->{payload}, 'echo:still',
+        'and the websocket still works afterwards');
+    close $held;
+    like(http_get('/plain'), qr/plain ok/, 'worker healthy at the end');
+}
+
+kill 'TERM', $pid;
+waitpid $pid, 0;
+
+done_testing();

@@ -1,0 +1,30 @@
+#!perl
+use 5.010;
+use strict;
+use warnings;
+use FindBin ();
+use lib "$FindBin::Bin/../lib";
+use Test::More;
+use Punk::Test;
+
+# The application is compiled once, at to_app, so a test that builds the app
+# is testing the same frozen coderef the server runs - and one Punk::Test
+# object is one browser: its cookie jar carries the session across every
+# request below. See `perldoc Punk::Test` for the full assertion set.
+chdir "$FindBin::Bin/.." or die "cannot chdir to the application root: $!\n";
+
+my $t = Punk::Test->new('{% name %}');
+
+$t->get_ok('/')
+  ->status_is(200)
+  ->content_like(qr/{% name %}/, 'renders the welcome page');
+
+$t->get_ok('/no-such-page')->status_is(404);
+{% if api %}
+# The API mount answers from the spec. The generated stubs return 501 until
+# you implement them - change this assertion as you do.
+my $op = lc('{% first_op.method %}') . '_ok';
+$t->$op('/api{% first_op.path_literal %}')
+  ->status_isnt(404, '{% first_op.id %} is routed from the spec');
+{% end %}
+done_testing();

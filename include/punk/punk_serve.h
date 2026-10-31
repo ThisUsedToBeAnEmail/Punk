@@ -1,0 +1,842 @@
+/* punk_serve.h - the request dispatcher, in C.
+ *
+ * The whole per-request path Punk::App::compile used to build as a Perl
+ * closure: static exact hit, API-mount route+dispatch, PSGI/static mounts,
+ * dynamic hit, 404/405, then for a web route the before hooks, the guards, the
+ * controller (or a websocket upgrade), and the response finish. Everything
+ * routes and validates through the C tiers already in place; the only Perl
+ * frames are the hooks, guards, controllers and mounted PSGI apps. The
+ * boot-time half of Punk::App (the registrar and compile) stays Perl.
+ *
+ * compile() freezes a `state` hash and returns sub { Punk::_serve($state,
+ * $_[0]) }. A nonblocking Future is handed to Punk::App::_finish_future
+ * (building the ->then chain is Perl's job); everything else finishes here.
+ *
+ * Must be included after punk_route.h, punk_dispatch.h and punk_context.h.
+ */
+
+#ifndef PUNK_SERVE_H
+#define PUNK_SERVE_H
+
+static const char PS_ERR_404[] = "{\"errors\":[{\"message\":\"Not Found\"}]}";
+static const char PS_ERR_403[] = "{\"errors\":[{\"message\":\"Forbidden\"}]}";
+static const char PS_ERR_405[] =
+    "{\"errors\":[{\"message\":\"Method Not Allowed\"}]}";
+
+/* the static mount's C body and its recogniser, defined in punk_static.h,
+ * which is included after this file (it needs the dispatcher's helpers) */
+static int punk_static_fast_ok(pTHX_ SV *mapp, AV **cap_out);
+static SV *punk_static_in(pTHX_ AV *cap, HV *env, const char *path,
+                          STRLEN plen, int is_head);
+
+static SV *ps_state(pTHX_ HV *st, const char *k) {
+    SV **e = hv_fetch(st, k, (I32)strlen(k), 0);
+    return (e && *e) ? *e : NULL;
+}
+static AV *ps_state_av(pTHX_ HV *st, const char *k) {
+    SV *v = ps_state(aTHX_ st, k);
+    return (v && SvROK(v) && SvTYPE(SvRV(v)) == SVt_PVAV) ? (AV *)SvRV(v) : NULL;
+}
+
+/* env{$key} as a borrowed const char*, or (def,*len). */
+static const char *ps_env_str(pTHX_ HV *env, const char *k, const char *def,
+                              STRLEN *len) {
+    SV **e = hv_fetch(env, k, (I32)strlen(k), 0);
+    if (e && *e && SvOK(*e) && SvCUR(*e)) return SvPV_const(*e, *len);
+    *len = strlen(def);
+    return def;
+}
+
+/* Bless a fresh context AV (the PCX_* layout from punk_context.h: 0=env,
+ * 1=app, 6=match) into the app's context class. match is owned. */
+static SV *ps_ctx(pTHX_ pk_state *S, HV *env, SV *match) {
+    AV *av = newAV();
+    /* room for every slot the plugins fill (request id, canon), so the
+     * array is not regrown twice per request */
+    av_extend(av, PCX_T0);
+    (void)av_store(av, PCX_ENV,   newRV_inc((SV *)env));
+    (void)av_store(av, PCX_APP,   newSVsv(S->app));
+    (void)av_store(av, PCX_MATCH, match);
+    return sv_bless(newRV_noinc((SV *)av), S->ctxstash);
+}
+
+/* The request context, built once.
+ *
+ * When a before_request hook has already made one, the routed match is stored
+ * into its PCX_MATCH slot rather than a second context being built: a stash
+ * written before routing has to survive into the handler, and it does not if
+ * the handler is handed a different object. match is owned; *cp is the
+ * caller's context slot, NULL until there is one.
+ *
+ * Do NOT decrement the match being replaced. av_store already frees the
+ * element it overwrites, so a dec here is a double free - one that surfaces
+ * later in the request as unrelated corruption. The only manual dec is for
+ * the store that did not take. */
+/* Every path that needs a context comes through here, built or reused, which
+ * is why pk_abi's current_of is set here and not at the four call sites. The
+ * restore is punk_serve's, on the save stack. */
+static SV *ps_ctx_for(pTHX_ SV **cp, pk_state *S, HV *env, SV *match) {
+    if (*cp) {
+        AV *av = (AV *)SvRV(*cp);
+        if (!av_store(av, PCX_MATCH, match)) SvREFCNT_dec(match);
+        pk_cur_set(aTHX_ *cp);
+        return *cp;
+    }
+    *cp = sv_2mortal(ps_ctx(aTHX_ S, env, match));
+    pk_cur_set(aTHX_ *cp);
+    return *cp;
+}
+
+/* The match hash the routed request fills in. When a context already exists
+ * (an observer or a before_request hook built it ahead of routing) its match
+ * hash is reused rather than a second one built and the first thrown away:
+ * the hook's hash gains `route` and the captures, which is what $c->match
+ * has always documented. Returns the hash to fill; *cp ends up pointing at
+ * the context that owns it. */
+static HV *ps_match_for(pTHX_ SV **cp, pk_state *S, HV *env) {
+    if (*cp) {
+        AV *av = (AV *)SvRV(*cp);
+        SV *m = pcx_get(aTHX_ av, PCX_MATCH);
+        if (m && SvROK(m) && SvTYPE(SvRV(m)) == SVt_PVHV) {
+            pk_cur_set(aTHX_ *cp);
+            return (HV *)SvRV(m);
+        }
+    }
+    {
+        HV *match = newHV();
+        (void)ps_ctx_for(aTHX_ cp, S, env, newRV_noinc((SV *)match));
+        return match;
+    }
+}
+
+/* May a response say what went wrong? In development, where the person
+ * reading it is the one who can fix it, and under test, where the reader is
+ * an assertion. Asked on the error path only, so a method call is
+ * affordable. An application with no answer is in production. */
+static int ps_app_is_dev(pTHX_ SV *c) {
+    AV *av = (c && SvROK(c)) ? pcx_av(aTHX_ c) : NULL;
+    SV *app = av ? pcx_get(aTHX_ av, PCX_APP) : NULL;
+    SV *env;
+    int dev = 0;
+    if (!(app && SvROK(app) && sv_isobject(app))) return 0;
+    env = pcx_call_meth(aTHX_ app, "env", NULL, 0, 1);
+    if (env) {
+        if (SvOK(env)) {
+            STRLEN el;
+            const char *ep = SvPV_const(env, el);
+            dev = (el == 11 && memEQ(ep, "development", 11))
+               || (el == 4  && memEQ(ep, "test", 4));
+        }
+        SvREFCNT_dec(env);
+    }
+    return dev;
+}
+
+/* An error line on the request's logger, the way $c->log->error would write
+ * it: with the method, the path and the request id the rest of the log has. */
+static void ps_log_error(pTHX_ SV *c, const char *msg, STRLEN len) {
+    AV *av = (c && SvROK(c)) ? pcx_av(aTHX_ c) : NULL;
+    SV *st, *lg;
+    HV *stash;
+    SV **cached;
+    if (!av) return;
+    while (len && (msg[len - 1] == '\n' || msg[len - 1] == '\r')) len--;
+    st = pcx_get(aTHX_ av, PCX_STASH);
+    if (!st) {
+        st = newRV_noinc((SV *)newHV());
+        (void)av_store(av, PCX_STASH, st);
+    }
+    stash = (HV *)SvRV(st);
+    cached = hv_fetchs(stash, "punk.logger", 0);
+    if (cached && *cached && SvROK(*cached)) lg = *cached;
+    else {
+        lg = pl_make_logger(aTHX_ pcx_get(aTHX_ av, PCX_APP), c);
+        (void)hv_stores(stash, "punk.logger", newSVsv(lg));
+        lg = *hv_fetchs(stash, "punk.logger", 0);
+    }
+    pl_emit(aTHX_ lg, PL_ERROR, sv_2mortal(newSVpvn(msg, len)), NULL);
+}
+
+/* $on_error->($c,$err) coerced, or the 500 default (+1). */
+static SV *punk_handle_error(pTHX_ SV *c, SV *err, SV *on_error) {
+    HV *body, *m; AV *errs; SV *bytes; STRLEN l; const char *p;
+    if (on_error && SvOK(on_error)) {
+        int died = 0;
+        SV *r = pcx_call2(aTHX_ on_error, c, err, &died);
+        if (!died && r && SvROK(r)) {
+            SV *co = punk_coerce(aTHX_ c, r);
+            SvREFCNT_dec(r);
+            return co;
+        }
+        if (r) SvREFCNT_dec(r);
+    }
+    body = newHV(); errs = newAV(); m = newHV();
+    p = SvOK(err) ? SvPV_const(err, l) : "";
+    if (!SvOK(err)) l = 0;
+    /* What a handler died with is for whoever runs the application: a file
+     * and a line, and from a database the statement, the DSN and sometimes
+     * the row. In development that is the person looking at the response.
+     * Anywhere else it goes to the log, at error, and the client is told
+     * only that it was not their fault. */
+    if (!ps_app_is_dev(aTHX_ c)) {
+        ps_log_error(aTHX_ c, p, l);
+        p = "Internal Server Error";
+        l = 21;
+    }
+    (void)hv_stores(m, "message", newSVpvn(p, l));
+    av_push(errs, newRV_noinc((SV *)m));
+    (void)hv_stores(body, "errors", newRV_noinc((SV *)errs));
+    bytes = punk_frj(aTHX)->encode(aTHX_ sv_2mortal(newRV_noinc((SV *)body)), NULL);
+    return punk_triplet(aTHX_ 500, sv_2mortal(newSVpvs("application/json")),
+                        bytes, NULL);
+}
+
+/* error -> handle_error; nonblocking Future -> Punk::App::_finish_future;
+ * else coerce; then deliver (+1). ret/err are borrowed. */
+static SV *punk_finish_c(pTHX_ SV *app, SV *c, SV *ret, SV *err, SV *on_error,
+                         const char *method, STRLEN mlen, AV *after, HV *env) {
+    int is_head = (mlen == 4 && memEQ(method, "HEAD", 4));
+    SV *resp, *out;
+    if (err && SvOK(err) && SvTRUE(err))
+        resp = punk_handle_error(aTHX_ c, err, on_error);
+    else if (SvROK(ret) && SvOBJECT(SvRV(ret)) && pcx_can(aTHX_ ret, "on_ready")) {
+        dSP; SV *r; int count;
+        ENTER; SAVETMPS;
+        PUSHMARK(SP); EXTEND(SP, 6);
+        PUSHs(app);
+        PUSHs(c);
+        PUSHs(ret);
+        PUSHs(on_error ? on_error : &PL_sv_undef);
+        PUSHs(sv_2mortal(newSVpvn(method, mlen)));
+        PUSHs(sv_2mortal(newRV_inc((SV *)(after ? after : newAV()))));
+        PUTBACK;
+        count = call_method("_finish_future", G_SCALAR);
+        SPAGAIN;
+        r = count > 0 ? SvREFCNT_inc(POPs) : &PL_sv_undef;
+        PUTBACK; FREETMPS; LEAVE;
+        return r;
+    }
+    else resp = punk_coerce(aTHX_ c, ret);
+    out = punk_deliver(aTHX_ c, resp, is_head, after);
+    SvREFCNT_dec(resp);
+    return out;
+}
+
+/* A constant-body 404/405 triplet, with an optional Allow header (owned). */
+static SV *ps_err_triplet(pTHX_ IV status, const char *b, STRLEN bl, SV *allow) {
+    AV *resp = newAV(), *headers = newAV(), *bodyav = newAV();
+    av_push(headers, newSVpvs("Content-Type"));
+    av_push(headers, newSVpvs("application/json"));
+    av_push(headers, newSVpvs("Content-Length"));
+    av_push(headers, newSViv((IV)bl));
+    if (allow) {
+        av_push(headers, newSVpvs("Allow"));
+        av_push(headers, allow);
+    }
+    av_push(bodyav, newSVpvn(b, bl));
+    av_push(resp, newSViv(status));
+    av_push(resp, newRV_noinc((SV *)headers));
+    av_push(resp, newRV_noinc((SV *)bodyav));
+    return newRV_noinc((SV *)resp);
+}
+
+/* The conditional-GET check, run between a route's guards and its handler.
+ * Defined in punk_cget.h, which is included after punk_sendfile.h because it
+ * uses that file's If-None-Match comparison rather than a second copy of it -
+ * the same split ps_serve_file uses. */
+static int pcg_check(pTHX_ SV *c, HV *rech, HV *env, const char *method,
+                     STRLEN mlen, SV **out, SV **errp);
+
+/* The idempotency replay check, in the same slot. Defined in punk_idem.h,
+ * which is included after punk_cachefront.h because the store is where the
+ * keys live. */
+static int pi_check(pTHX_ SV *c, HV *rech, HV *env, const char *method,
+                    STRLEN mlen, SV *cfg, SV **out, SV **errp);
+
+/* does path (plen) start with prefix (pfl) on a segment boundary? */
+static int ps_under(const char *path, STRLEN plen, const char *pf, STRLEN pfl) {
+    return plen >= pfl && memEQ(path, pf, pfl)
+        && (plen == pfl || path[pfl] == '/');
+}
+
+static SV *ps_serve_one(pTHX_ pk_state *S, HV *env) {
+    AV *recs   = S->recs;
+    AV *apims  = S->apims;
+    AV *mounts = S->mounts;
+    SV *app    = S->app;
+    AV *before = S->before;
+    AV *after  = S->after;
+    SV *on_err = S->on_err;
+    pr_router *rt = S->rt;
+    IV ridx = -1;                      /* the matched record's index */
+
+    STRLEN mlen, plen;
+    const char *method;
+    int ext_connect = 0;
+
+    /* Where a large multipart part spills. The parser has the request's env
+     * and nothing else - the env belongs to the server - so the one place
+     * this can be handed over is here, and only when an application named
+     * a directory. */
+    if (S->upload_dir)
+        (void)hv_stores(env, "punk.upload_dir", newSVsv(S->upload_dir));
+
+    /* Reverse-proxy trust, before anything reads the env: REMOTE_ADDR is
+     * rewritten to the real client so rate_limit, block_ip, the access log
+     * and $c->req all see it without any of them being changed. */
+    if (S->proxy) pp_resolve(aTHX_ S->proxy, env);
+
+    method = ps_env_str(aTHX_ env, "REQUEST_METHOD", "GET", &mlen);
+
+    /* An Extended CONNECT (RFC 8441 / RFC 9220) is routed as the GET it
+     * stands in for.
+     *
+     * A `websocket` route registers as a GET route - it is a GET upgrade on
+     * HTTP/1.1 - so a CONNECT would match nothing and the client would get a
+     * 405 for a request that is a websocket handshake. That the pseudo
+     * request carries :scheme and :path at all, which an ordinary CONNECT
+     * does not, is exactly so it can be routed this way.
+     *
+     * Only the METHOD USED FOR MATCHING changes. REQUEST_METHOD in $env
+     * still reads CONNECT, which is what punk_ws_dispatch keys on and what
+     * an application should see.
+     *
+     * `ext_connect` is what the rewrite costs and has to pay back. Matching
+     * as GET reaches every GET route, every API operation and every mount,
+     * while the origin check lives in punk_ws_dispatch and so runs only once
+     * a `ws` route has matched. On this transport a 2xx IS the acceptance,
+     * written as :status on the CONNECT stream, so a page anywhere could
+     * otherwise open a socket at any path and read open-or-error as that
+     * path's status - the cross-origin status read a browser exists to
+     * prevent, with the user's cookies attached. The flag is carried to the
+     * gate below, which is where a CONNECT that did not land on a websocket
+     * route stops. */
+    if (mlen == 7 && memEQ(method, "CONNECT", 7)) {
+        SV **cp = hv_fetchs(env, "psgix.connect_protocol", 0);
+        if (cp && *cp && SvOK(*cp) && SvCUR(*cp) == 9
+            && memEQ(SvPVX(*cp), "websocket", 9)) {
+            ext_connect = 1;
+            method = "GET";
+            mlen   = 3;
+        }
+    }
+    const char *path   = ps_env_str(aTHX_ env, "PATH_INFO", "/", &plen);
+    int is_head = (mlen == 4 && memEQ(method, "HEAD", 4));
+    SV *rec = NULL, *caps = NULL;
+    AV *api_allow = NULL;
+    SV *c = NULL;                            /* the one context, once built */
+
+    {   /* before_request: the only phase that runs before routing, so the
+         * only one a 404, a 405 or a mount ever reaches. It runs here -
+         * after the proxy resolve, because a hook that logs or samples by
+         * client address must see the corrected REMOTE_ADDR the same way
+         * rate_limit and the access log do, and after the method/path reads,
+         * because a short-circuit needs them and they allocate nothing.
+         *
+         * Being first is also what it costs: this is ahead of the csrf
+         * check, ahead of rate_limit and ahead of the max_body ceiling, so
+         * the hook sees requests all three will refuse. For a span that is
+         * the point; for work done on the client's behalf, before_dispatch
+         * is still the right phase.
+         *
+         * compile omits the state key when the chain is empty, so an app
+         * with no such hook pays one hv_fetch and one branch. */
+        AV *before_req = S->before_req;
+        int has_hooks = before_req != NULL;
+
+        /* The C ABI's observers register process-globally and run here, ahead
+         * of any Perl phase - a consumer measuring a request should start
+         * before the first frame this framework hands to an application.
+         * Registering either observer is what makes the context get built,
+         * which is the guarantee that the response side sees the same one. */
+        if (PK_OBS_ANY || has_hooks) {
+            HV *match = newHV();
+            /* a real hashref with empty captures, not undef, so $c->match and
+             * $c->param behave inside the hook instead of croaking */
+            (void)hv_stores(match, "captures", newRV_noinc((SV *)newHV()));
+            (void)ps_ctx_for(aTHX_ &c, S, env, newRV_noinc((SV *)match));
+        }
+        if (PK_OBS_WANT_REQ) pk_obs_fire_req(aTHX_ c);
+
+        if (has_hooks) {
+            SV *ret = &PL_sv_undef, *err = &PL_sv_undef;
+            if (pd_run_chain(aTHX_ before_req, c, &ret, &err)) {
+                SV *out;
+                if (ext_connect) {
+                    /* A hook that answers for itself runs ahead of the gate
+                     * below, and its answer to an upgrade would be the
+                     * oracle that gate closes: a page elsewhere reading a
+                     * path's status as a websocket open or error. So an
+                     * Extended CONNECT it short-circuits gets the one fixed
+                     * answer every non-websocket path gives. */
+                    if (ret != &PL_sv_undef) SvREFCNT_dec(ret);
+                    if (err != &PL_sv_undef) SvREFCNT_dec(err);
+                    out = ps_err_triplet(aTHX_ 404, PS_ERR_404,
+                                         sizeof(PS_ERR_404) - 1, NULL);
+                    if (PK_OBS_WANT_RES) pk_obs_fire_res(aTHX_ c, out);
+                    return out;
+                }
+                out = punk_finish_c(aTHX_ app, c, ret, err, on_err,
+                                    method, mlen, after, env);
+                if (ret != &PL_sv_undef) SvREFCNT_dec(ret);
+                if (err != &PL_sv_undef) SvREFCNT_dec(err);
+                return out;
+            }
+        }
+    }
+
+    /* 1. static exact hit */
+    if (rt) {
+        IV i = pr_static_match(aTHX_ rt, method, mlen, path, plen);
+        if (i >= 0) {
+            SV **rp = av_fetch(recs, i, 0);
+            if (rp && *rp) { rec = *rp; ridx = i; }
+        }
+    }
+
+    /* 2. API mounts.
+     *
+     * The COUNT is checked, not just the array: api_mounts is always present
+     * in the compiled state, so an app that declared no `api` at all still
+     * arrives here with an empty one - and punk_oa croaks when Open::API's
+     * ABI does not match. That made Open::API an effective hard requirement
+     * of the dynamic-route path for every app in the world, and the failure
+     * it produced named the API path, which the app was not using.
+     *
+     * An Extended CONNECT skips the whole loop. An OpenAPI operation is
+     * never a websocket route, so there is nothing here it can legitimately
+     * reach, and the gate below would refuse the answer anyway - after the
+     * operation's handler had already run. */
+    if (!rec && !ext_connect && apims && av_len(apims) >= 0) {
+        const oa_abi *A = punk_oa(aTHX);
+        SSize_t ai, an = av_len(apims) + 1;
+        for (ai = 0; ai < an; ai++) {
+            SV **mp = av_fetch(apims, ai, 0);
+            HV *am; SV *api; SV **x;
+            const char *pf, *rest; STRLEN pfl, restl;
+            void *api_c, *op; HV *capsh; AV *allowv; SV *opid; HE *he; SV *oprec;
+            IV maxb; SV *mon_err; HV *ops;
+            if (!mp || !*mp || !SvROK(*mp)) continue;
+            am = (HV *)SvRV(*mp);
+            x = hv_fetchs(am, "prefix", 0);
+            if (x && *x && SvOK(*x)) pf = SvPV_const(*x, pfl); else { pf = ""; pfl = 0; }
+            if (!ps_under(path, plen, pf, pfl)) continue;
+            rest = plen > pfl ? path + pfl : "/";
+            restl = plen > pfl ? plen - pfl : 1;
+            api = *hv_fetchs(am, "api", 0);
+            api_c = A->api_of(aTHX_ api);
+            capsh  = (HV *)sv_2mortal((SV *)newHV());
+            allowv = (AV *)sv_2mortal((SV *)newAV());
+            op = api_c ? A->route(aTHX_ api_c, method, mlen, rest, restl, capsh, allowv) : NULL;
+            if (!op && is_head)
+                op = api_c ? A->route(aTHX_ api_c, "GET", 3, rest, restl, capsh, allowv) : NULL;
+            if (!op) {
+                if (av_len(allowv) >= 0) {
+                    SSize_t j, n = av_len(allowv) + 1;
+                    if (!api_allow) api_allow = (AV *)sv_2mortal((SV *)newAV());
+                    for (j = 0; j < n; j++) { SV **a = av_fetch(allowv, j, 0);
+                        if (a && *a) av_push(api_allow, newSVsv(*a)); }
+                }
+                continue;
+            }
+            opid = A->op_id(aTHX_ op);
+            x = hv_fetchs(am, "ops", 0);
+            ops = (x && *x && SvROK(*x)) ? (HV *)SvRV(*x) : NULL;
+            he = ops ? hv_fetch_ent(ops, opid, 0, 0) : NULL;
+            oprec = he ? HeVAL(he) : NULL;
+            x = hv_fetchs(am, "max_body", 0);
+            maxb = (x && *x && SvOK(*x)) ? SvIV(*x) : 0;
+            x = hv_fetchs(am, "on_error", 0);
+            mon_err = (x && *x && SvOK(*x)) ? *x : on_err;
+            {
+                HV *match = newHV();
+                SV *ret = &PL_sv_undef, *err = &PL_sv_undef, *out;
+                (void)hv_stores(match, "captures", newRV_inc((SV *)capsh));
+                (void)hv_stores(match, "operation", newSVsv(opid));
+                (void)ps_ctx_for(aTHX_ &c, S, env, newRV_noinc((SV *)match));
+                if (oprec && SvROK(oprec) && SvTYPE(SvRV(oprec)) == SVt_PVHV)
+                    punk_oa_dispatch(aTHX_ c, before, (HV *)SvRV(oprec), api, opid,
+                        sv_2mortal(newRV_inc((SV *)capsh)), maxb, &ret, &err);
+                out = punk_finish_c(aTHX_ app, c, ret, err, mon_err, method, mlen, after, env);
+                if (ret != &PL_sv_undef) SvREFCNT_dec(ret);
+                if (err != &PL_sv_undef) SvREFCNT_dec(err);
+                return out;
+            }
+        }
+    }
+
+    /* 3. PSGI / static mounts.
+     *
+     * Also skipped on an Extended CONNECT, and for a sharper reason than the
+     * API mounts: a mounted app owns its answer and never comes back through
+     * the gate below, so delegating one would hand a request Punk's own
+     * router is about to refuse to an app that sees REQUEST_METHOD CONNECT
+     * and answers on path alone. A mounted PUNK app with websocket routes of
+     * its own is the case this gives up; it is not reachable over HTTP/2 or
+     * HTTP/3 until a mount can declare that it wants the handshake. */
+    if (!rec && !ext_connect && mounts) {
+        SSize_t mi, mn = av_len(mounts) + 1;
+        for (mi = 0; mi < mn; mi++) {
+            SV **mp = av_fetch(mounts, mi, 0);
+            HV *m; SV **x; const char *pf; STRLEN pfl; SV *mapp;
+            if (!mp || !*mp || !SvROK(*mp)) continue;
+            m = (HV *)SvRV(*mp);
+            x = hv_fetchs(m, "prefix", 0);
+            if (x && *x && SvOK(*x)) pf = SvPV_const(*x, pfl); else { pf = ""; pfl = 0; }
+            if (!ps_under(path, plen, pf, pfl)) continue;
+            mapp = *hv_fetchs(m, "app", 0);
+            {   /* A `static` mount of this framework's own, answering a GET
+                 * or HEAD: its C body, handed the sub-path. The env rewrite
+                 * and the Perl frame below exist for a mounted PSGI app;
+                 * this one reads neither SCRIPT_NAME nor PATH_INFO. */
+                AV *scap;
+                if ((is_head || (mlen == 3 && memEQ(method, "GET", 3)))
+                    && punk_static_fast_ok(aTHX_ mapp, &scap)) {
+                    SV *r = punk_static_in(aTHX_ scap, env,
+                                           plen > pfl ? path + pfl : "/",
+                                           plen > pfl ? plen - pfl : 1,
+                                           is_head);
+                    if (PK_OBS_WANT_RES) pk_obs_fire_res(aTHX_ c, r);
+                    return r;
+                }
+            }
+            {
+                SV *save_sn, *save_pi, *newsn, *newpi, *r;
+                SV **sn = hv_fetchs(env, "SCRIPT_NAME", 0);
+                SV **pi = hv_fetchs(env, "PATH_INFO", 0);
+                dSP; int count;
+                save_sn = (sn && *sn) ? newSVsv(*sn) : NULL;
+                save_pi = (pi && *pi) ? newSVsv(*pi) : NULL;
+                newsn = save_sn ? newSVsv(save_sn) : newSVpvs("");
+                sv_catpvn(newsn, pf, pfl);
+                (void)hv_stores(env, "SCRIPT_NAME", newsn);
+                newpi = plen > pfl ? newSVpvn(path + pfl, plen - pfl) : newSVpvs("/");
+                (void)hv_stores(env, "PATH_INFO", newpi);
+                ENTER; SAVETMPS;
+                PUSHMARK(SP); EXTEND(SP, 1);
+                PUSHs(sv_2mortal(newRV_inc((SV *)env)));
+                PUTBACK;
+                count = call_sv(mapp, G_SCALAR);
+                SPAGAIN;
+                r = count > 0 ? SvREFCNT_inc(POPs) : &PL_sv_undef;
+                PUTBACK; FREETMPS; LEAVE;
+                (void)hv_stores(env, "SCRIPT_NAME", save_sn ? save_sn : newSV(0));
+                (void)hv_stores(env, "PATH_INFO",   save_pi ? save_pi : newSV(0));
+                /* a mounted app owns its answer and never comes through
+                 * punk_deliver, so the observers are fired here */
+                if (PK_OBS_WANT_RES) pk_obs_fire_res(aTHX_ c, r);
+                return r;
+            }
+        }
+    }
+
+    if (!rec && rt) {                        /* 4. dynamic hit, else allow */
+        HV *capsh = (HV *)sv_2mortal((SV *)newHV());
+        IV idx = pr_match(aTHX_ rt, method, mlen, path, plen, capsh);
+        if (idx >= 0) {
+            SV **rp = av_fetch(recs, idx, 0);
+            if (rp && *rp) { rec = *rp; ridx = idx; }
+            caps = sv_2mortal(newRV_inc((SV *)capsh));
+        }
+        else {
+            AV *allowv = (AV *)sv_2mortal((SV *)newAV());
+            if (pr_allow(aTHX_ rt, method, mlen, path, plen, allowv))
+                caps = sv_2mortal(newRV_inc((SV *)allowv));
+        }
+    }
+
+    /* 5. trailing-slash rescue: "/account/" answers the route declared as
+     *    "/account". It runs only once everything above has missed, so a
+     *    route, API operation or mount that really does want the slash still
+     *    wins on its own terms first. Mounts are deliberately not retried:
+     *    a mounted app is entitled to tell "/docs" from "/docs/", and is the
+     *    one that should decide. */
+    if (!rec && rt && plen > 1 && path[plen - 1] == '/') {
+        STRLEN tl = plen;
+        IV i;
+        while (tl > 1 && path[tl - 1] == '/') tl--;
+        i = pr_static_match(aTHX_ rt, method, mlen, path, tl);
+        if (i >= 0) {
+            SV **rp = av_fetch(recs, i, 0);
+            if (rp && *rp) { rec = *rp; ridx = i; caps = NULL; }
+        }
+        if (!rec) {
+            HV *capsh = (HV *)sv_2mortal((SV *)newHV());
+            IV idx = pr_match(aTHX_ rt, method, mlen, path, tl, capsh);
+            if (idx >= 0) {
+                SV **rp = av_fetch(recs, idx, 0);
+                if (rp && *rp) { rec = *rp; ridx = idx;
+                                 caps = sv_2mortal(newRV_inc((SV *)capsh)); }
+            }
+            else if (!caps) {                /* keep the untrimmed Allow if any */
+                AV *allowv = (AV *)sv_2mortal((SV *)newAV());
+                if (pr_allow(aTHX_ rt, method, mlen, path, tl, allowv))
+                    caps = sv_2mortal(newRV_inc((SV *)allowv));
+            }
+        }
+    }
+
+    /* The Extended CONNECT gate: an upgrade is answerable by a websocket
+     * route and by nothing else.
+     *
+     * Everything above matched as GET, which is the point and also the whole
+     * exposure: without this, a CONNECT landing on an ordinary route ran its
+     * guards and its handler, and the status came back as :status on the
+     * CONNECT stream, where 2xx means accepted. A cross-origin page reads
+     * that as open-or-error and has a one-bit oracle on any path, cookies
+     * included - and the body that follows is written as DATA frames the
+     * client parses as RFC 6455, so it is not reliably one bit either.
+     *
+     * The refusal is ONE status for every miss, and deliberately not the 405
+     * merge or on_not_found below: "this path is a route under some other
+     * method" and "the app has a custom 404" are both answers, and an answer
+     * that varies by path is the same oracle in a smaller font. A route that
+     * IS a websocket falls through to the dispatch, where the origin check
+     * and the route's own `origin` option decide. */
+    if (ext_connect) {
+        int is_ws = (rec && ridx >= 0 && ridx < S->nrec && S->rec[ridx].ws);
+        if (!is_ws) {
+            SV *out = ps_err_triplet(aTHX_ 404, PS_ERR_404,
+                                     sizeof(PS_ERR_404) - 1, NULL);
+            if (PK_OBS_WANT_RES) pk_obs_fire_res(aTHX_ c, out);
+            return out;
+        }
+    }
+
+    if (!rec) {                              /* 405 (merge allow) or 404 */
+        HV *seen = (HV *)sv_2mortal((SV *)newHV());
+        AV *lists[2];
+        int li;
+        lists[0] = (caps && SvROK(caps) && SvTYPE(SvRV(caps)) == SVt_PVAV)
+                   ? (AV *)SvRV(caps) : NULL;
+        lists[1] = api_allow;
+        for (li = 0; li < 2; li++) {
+            AV *l = lists[li]; SSize_t j, n;
+            if (!l) continue;
+            n = av_len(l) + 1;
+            for (j = 0; j < n; j++) { SV **a = av_fetch(l, j, 0);
+                if (a && *a) (void)hv_store_ent(seen, *a, PUNK_SET_TRUE, 0); }
+        }
+        (void)hv_delete(seen, method, (I32)mlen, 0);
+        if (HvUSEDKEYS(seen)) {
+            AV *sorted = (AV *)sv_2mortal((SV *)newAV());
+            SV *joined; HE *he; SSize_t na = 0, k;
+            hv_iterinit(seen);
+            while ((he = hv_iternext(seen))) { av_push(sorted, newSVsv(hv_iterkeysv(he))); na++; }
+            if (na > 1) sortsv(AvARRAY(sorted), (STRLEN)na, Perl_sv_cmp);
+            joined = newSVpvs("");
+            for (k = 0; k < na; k++) { SV **a = av_fetch(sorted, k, 0);
+                if (k) sv_catpvs(joined, ", "); if (a && *a) sv_catsv(joined, *a); }
+            {   /* the house 405 runs no after-hooks and so never reaches
+                 * punk_deliver; the observers still get their one event */
+                SV *out = ps_err_triplet(aTHX_ 405, PS_ERR_405,
+                                         sizeof(PS_ERR_405) - 1, joined);
+                if (PK_OBS_WANT_RES) pk_obs_fire_res(aTHX_ c, out);
+                return out;
+            }
+        }
+        {   /* on_not_found: the app's own 404, the on_error contract - a
+             * reference return becomes the response (after hooks run, a
+             * Future is awaited), anything else keeps the default below,
+             * and a die inside it goes through on_error. The 405 above is
+             * deliberately not covered: its Allow semantics stay. */
+            SV *on_nf = S->on_nf;
+            if (on_nf) {
+                HV *match = newHV();
+                SV *r = NULL;
+                int died;
+                (void)hv_stores(match, "captures", newRV_noinc((SV *)newHV()));
+                (void)ps_ctx_for(aTHX_ &c, S, env, newRV_noinc((SV *)match));
+                {
+                    dSP; int count;
+                    ENTER; SAVETMPS;
+                    PUSHMARK(SP); EXTEND(SP, 1);
+                    PUSHs(c);
+                    PUTBACK;
+                    count = call_sv(on_nf, G_SCALAR | G_EVAL);
+                    SPAGAIN;
+                    if (count > 0) { SV *t = POPs; r = SvREFCNT_inc(t); }
+                    PUTBACK; FREETMPS; LEAVE;
+                    died = SvTRUE(ERRSV) ? 1 : 0;
+                }
+                if (died) {
+                    SV *errsv = sv_2mortal(newSVsv(ERRSV));
+                    SV *out = punk_finish_c(aTHX_ app, c, &PL_sv_undef, errsv,
+                                            on_err, method, mlen, after, env);
+                    if (r) SvREFCNT_dec(r);
+                    return out;
+                }
+                if (r && SvROK(r)) {
+                    SV *out = punk_finish_c(aTHX_ app, c, r, &PL_sv_undef,
+                                            on_err, method, mlen, after, env);
+                    SvREFCNT_dec(r);
+                    return out;
+                }
+                if (r) SvREFCNT_dec(r);   /* declined: the default stands */
+            }
+        }
+        {   /* likewise the house 404 (on_not_found returning a response goes
+             * through punk_finish_c and is covered there instead) */
+            SV *out = ps_err_triplet(aTHX_ 404, PS_ERR_404,
+                                     sizeof(PS_ERR_404) - 1, NULL);
+            if (PK_OBS_WANT_RES) pk_obs_fire_res(aTHX_ c, out);
+            return out;
+        }
+    }
+
+    /* 5. web route: ctx, before + guards, controller/ws, finish */
+    {
+        HV *rech = (HV *)SvRV(rec);
+        /* the record's hot fields, mirrored at compile (punk_state.h) */
+        const pk_rec_c *R = (ridx >= 0 && ridx < S->nrec) ? &S->rec[ridx]
+                                                          : NULL;
+        pk_rec_c none;
+        HV *match;
+        SV *ret = &PL_sv_undef, *err = &PL_sv_undef, *out;
+        int shorted;
+        if (!R) { pk_rec_mirror(aTHX_ &none, rec); R = &none; }
+        /* the hook's match hash when a context exists already, else a new
+         * one in a new context */
+        match = ps_match_for(aTHX_ &c, S, env);
+        if (caps && SvROK(caps) && SvTYPE(SvRV(caps)) == SVt_PVHV)
+            (void)hv_stores(match, "captures", newRV_inc(SvRV(caps)));
+        else
+            (void)hv_stores(match, "captures", newRV_noinc((SV *)newHV()));
+        /* the matched route record, which Punk::Context has always documented
+         * $c->match as carrying and which nothing actually put there. It is
+         * what names the route as DECLARED - "/users/:id" - for anything
+         * grouping by route rather than by path, the C ABI included. */
+        (void)hv_stores(match, "route", newSVsv(rec));
+
+        {   /* The body ceiling, before the hook chain and before the guards:
+             * an oversize request should cost no auth lookup, no validation,
+             * no body parse and no Perl frame. A route's own value wins over
+             * the app-wide one, and 0 on a route disables the check there. */
+            IV lim = R->has_max_body ? R->max_body
+                   : S->has_max_body ? S->max_body
+                   : 0;
+            if (lim > 0) {
+                SV *over = pd_body_limit(aTHX_ env, lim);
+                if (over) {   /* the 413 refuses before the hook chain, so it
+                               * too skips punk_deliver */
+                    if (PK_OBS_WANT_RES) pk_obs_fire_res(aTHX_ c, over);
+                    return over;
+                }
+            }
+        }
+
+        shorted = pd_run_chain(aTHX_ before, c, &ret, &err);
+        if (!shorted && R->guards)
+            shorted = pd_run_chain(aTHX_ R->guards, c, &ret, &err);
+        if (!shorted) {
+            /* The conditional GET, after the guards and before the handler.
+             * Not earlier: before_dispatch runs ahead of the guards, and a
+             * 304 there would answer a request an authentication guard was
+             * about to refuse. Inert unless the plugin is registered, and
+             * one hv_fetch when it is not - the `sitemap` arrangement. */
+            SV *cg = S->cget;
+            if (cg) {
+                SV *cgout = NULL, *cgerr = NULL;
+                /* `etag => 1` hashes the body this route renders, so the
+                 * body has to come out the same way every time */
+                if (R->etag)
+                    (void)av_store(pcx_av(aTHX_ c), PCX_CANON, newSViv(1));
+                if (pcg_check(aTHX_ c, rech, env, method, mlen,
+                              &cgout, &cgerr)) {
+                    if (cgerr) err = cgerr;      /* the app's 500 */
+                    else       ret = cgout;      /* the 304 */
+                    shorted = 1;
+                }
+            }
+        }
+        if (!shorted) {
+            /* Idempotency, in the same slot and for the same reason: a
+             * replay returns a stored response BODY, so answering it ahead
+             * of the guards would hand somebody else's order to a caller
+             * the guard was about to refuse. The two never both fire - one
+             * answers GET and HEAD, the other only unsafe methods. */
+            SV *ic = S->idem;
+            if (ic && R->idempotent) {
+                SV *iout = NULL, *ierr = NULL;
+                if (pi_check(aTHX_ c, rech, env, method, mlen, ic,
+                             &iout, &ierr)) {
+                    if (ierr) err = ierr;
+                    else      ret = iout;        /* the replay, 400 or 422 */
+                    shorted = 1;
+                }
+            }
+        }
+        if (!shorted) {
+            int died = 0;
+            if (R->ws || R->sse) {
+                const char *disp = R->ws
+                    ? "Punk::WebSocket::_dispatch" : "Punk::SSE::_dispatch";
+                dSP; int count;
+                ENTER; SAVETMPS;
+                PUSHMARK(SP); EXTEND(SP, 3);
+                PUSHs(c); PUSHs(rec);
+                PUSHs(sv_2mortal(newRV_inc((SV *)env)));
+                PUTBACK;
+                count = call_pv(disp, G_SCALAR | G_EVAL);
+                SPAGAIN;
+                ret = count > 0 ? SvREFCNT_inc(POPs) : &PL_sv_undef;
+                PUTBACK; FREETMPS; LEAVE;
+                died = SvTRUE(ERRSV) ? 1 : 0;
+            }
+            else {
+                ret = pd_call(aTHX_ R->code ? R->code : &PL_sv_undef, c, &died);
+            }
+            if (died) err = newSVsv(ERRSV);
+        }
+        out = punk_finish_c(aTHX_ app, c, ret, err, on_err, method, mlen, after, env);
+        {   /* compress => 0: say so in the one place the server will look.
+             * `identity` is the documented hands-off spelling (Hyperman
+             * strips it before writing); a response that already declares
+             * an encoding has said something more specific and is left. */
+            if (R->nocompress
+                && out && SvROK(out) && SvTYPE(SvRV(out)) == SVt_PVAV) {
+                AV *ra = (AV *)SvRV(out);
+                SV **hp = av_fetch(ra, 1, 0);
+                if (hp && *hp && SvROK(*hp) && SvTYPE(SvRV(*hp)) == SVt_PVAV) {
+                    AV *hdrs = (AV *)SvRV(*hp);
+                    SSize_t j, hn = av_len(hdrs) + 1;
+                    int seen = 0;
+                    for (j = 0; j + 1 < hn; j += 2) {
+                        SV **k = av_fetch(hdrs, j, 0);
+                        STRLEN kl;
+                        const char *ks;
+                        if (!(k && *k)) continue;
+                        ks = SvPV_const(*k, kl);
+                        if (kl == 16 && foldEQ(ks, "Content-Encoding", 16))
+                            { seen = 1; break; }
+                    }
+                    if (!seen) {
+                        av_push(hdrs, newSVpvs("Content-Encoding"));
+                        av_push(hdrs, newSVpvs("identity"));
+                    }
+                }
+            }
+        }
+        if (ret != &PL_sv_undef) SvREFCNT_dec(ret);
+        if (err != &PL_sv_undef) SvREFCNT_dec(err);
+        return out;
+    }
+}
+
+/* The dispatch frame, which is what makes pk_abi's current_of safe to read.
+ *
+ * ps_serve_one has nine returns and a croak can leave it by none of them, so
+ * the restore goes on the save stack rather than at the end of the body. The
+ * PREVIOUS value is what goes back, not NULL: a mounted application inside
+ * another one has to leave the outer context where the outer frame will find
+ * it. */
+static SV *punk_serve(pTHX_ pk_state *S, HV *env) {
+    SV *out;
+    ENTER;
+    SAVEDESTRUCTOR_X(pk_cur_restore, (void *)PK_CURRENT);
+    out = ps_serve_one(aTHX_ S, env);
+    LEAVE;
+    return out;
+}
+
+#endif /* PUNK_SERVE_H */

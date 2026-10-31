@@ -1,0 +1,468 @@
+/* punk_context.h - the per-request context object, in C.
+ *
+ * Punk::Context is a blessed AV whose slots are defined here and nowhere else:
+ * this enum is the whole storage contract. Both faces of it are C - the plain
+ * accessors (env/app/_req/_res/stash_hv/openapi_params/match) and the hot
+ * methods (req/res/stash/param/json/text/html/...) are all XSUBs in
+ * xs/context.xs reading these slots directly, and _build fills them. There is
+ * no Perl-side class builder to keep in step, so lib/Punk/Context.pm is
+ * documentation only.
+ *
+ * Perl headers and punk_response.h (punk_triplet, the PS_* Response slots)
+ * must be in scope before this file.
+ */
+
+#ifndef PUNK_CONTEXT_H
+#define PUNK_CONTEXT_H
+
+/* The slot layout. The accessor XSUB's ALIAS indices run in this same order
+ * (see xs/context.xs), which is what lets it map ix straight to a slot. */
+enum {
+    PCX_ENV     = 0,
+    PCX_APP     = 1,
+    PCX_REQ     = 2,
+    PCX_RES     = 3,
+    PCX_STASH   = 4,
+    PCX_OPENAPI = 5,
+    PCX_MATCH   = 6,
+    PCX_UA      = 7,  /* memoised $c->ua; the agent itself lives on the app */
+    PCX_REQID   = 8,  /* Punk::Plugin::RequestId's id, when it is loaded     */
+    PCX_AFTER_RES = 9, /* $c->after_response's queue, vivified on first use  */
+    PCX_CANON   = 10, /* set when the route's body is hashed for an ETag:
+                         JSON is then encoded with its keys in order      */
+    PCX_T0      = 11  /* Punk::Plugin::Metrics' request start, seconds;
+                         negative for a request it does not count        */
+};
+
+static AV *pcx_av(pTHX_ SV *self) {
+    if (!SvROK(self) || SvTYPE(SvRV(self)) != SVt_PVAV)
+        croak("Punk::Context: not a context object");
+    return (AV *)SvRV(self);
+}
+
+/* the slot value, or NULL when unset */
+static SV *pcx_get(pTHX_ AV *av, I32 slot) {
+    SV **e = av_fetch(av, slot, 0);
+    return (e && *e && SvOK(*e)) ? *e : NULL;
+}
+
+/* JSON for a response body (+1). Keys in hash order, which is whatever this
+ * process happens to hold - unless the route's body is about to be hashed
+ * into an ETag, where an order that differs between workers, hosts and
+ * restarts is a validator that never matches. */
+static SV *pcx_json(pTHX_ AV *av, SV *data) {
+    SV *canon = pcx_get(aTHX_ av, PCX_CANON);
+    if (canon && SvTRUE(canon)) {
+        frj_opts o;
+        Zero(&o, 1, frj_opts);
+        o.canonical = 1;
+        return punk_frj(aTHX)->encode(aTHX_ data, &o);
+    }
+    return punk_frj(aTHX)->encode(aTHX_ data, NULL);
+}
+
+/* the Punk::Response AV at PCX_RES (its slots are the PS_* from
+ * punk_response.h), or NULL when the response was never forced. */
+static AV *pcx_res_av(pTHX_ AV *av) {
+    SV *r = pcx_get(aTHX_ av, PCX_RES);
+    return (r && SvROK(r) && SvTYPE(SvRV(r)) == SVt_PVAV) ? (AV *)SvRV(r) : NULL;
+}
+
+/* the pending response status (PS_STATUS), or 0 */
+static IV pcx_res_status(pTHX_ AV *res) {
+    SV **e = res ? av_fetch(res, PS_STATUS, 0) : NULL;
+    return (e && *e && SvOK(*e)) ? SvIV(*e) : 0;
+}
+
+/* the pending response header pair-AV (PS_HEADERS), or NULL */
+static AV *pcx_res_headers(pTHX_ AV *res) {
+    SV **e = res ? av_fetch(res, PS_HEADERS, 0) : NULL;
+    return (e && *e && SvROK(*e) && SvTYPE(SvRV(*e)) == SVt_PVAV)
+        ? (AV *)SvRV(*e) : NULL;
+}
+
+/* Lazily build the sub-object in a slot (Punk::Request / Punk::Response) with
+ * Class->new($arg?), caching it. Returns it borrowed (the slot owns it). */
+static SV *pcx_force(pTHX_ AV *av, I32 slot, const char *class, SV *arg) {
+    SV *cur = pcx_get(aTHX_ av, slot);
+    if (cur) return cur;
+    {
+        dSP; SV *obj; int count;
+        ENTER; SAVETMPS;
+        PUSHMARK(SP); EXTEND(SP, arg ? 2 : 1);
+        PUSHs(sv_2mortal(newSVpv(class, 0)));
+        if (arg) PUSHs(arg);
+        PUTBACK;
+        count = call_method("new", G_SCALAR);
+        SPAGAIN;
+        obj = count > 0 ? POPs : &PL_sv_undef;
+        SvREFCNT_inc(obj);
+        PUTBACK; FREETMPS; LEAVE;
+        (void)av_store(av, slot, obj);
+        return obj;
+    }
+}
+
+/* Call $obj->$meth(@argv) in its own stack scope, returning the scalar result
+ * (+1) when want is true, else NULL. argv holds stable SV* captured before any
+ * stack manipulation (EXTEND may move the caller's stack, staling ST()). */
+static SV *pcx_call_meth(pTHX_ SV *obj, const char *meth,
+                         SV **argv, int nargs, int want) {
+    dSP; SV *r = NULL; int count, i;
+    ENTER; SAVETMPS;
+    PUSHMARK(SP);
+    EXTEND(SP, nargs + 1);
+    PUSHs(obj);
+    for (i = 0; i < nargs; i++) PUSHs(argv[i]);
+    PUTBACK;
+    count = call_method(meth, want ? G_SCALAR : G_VOID);
+    SPAGAIN;
+    if (want && count > 0) r = SvREFCNT_inc(POPs);
+    PUTBACK; FREETMPS; LEAVE;
+    return r;
+}
+
+/* The context's own parameter layers, in precedence order: the validated
+ * OpenAPI params (path, then query), then the route captures. Borrowed,
+ * NULL when neither carries the name - the request is the caller's
+ * fallback, because reaching it forces Punk::Request into being. */
+static SV *pcx_param_local(pTHX_ AV *av, SV *name) {
+    STRLEN nl;
+    const char *n = SvPV_const(name, nl);
+    SV *op = pcx_get(aTHX_ av, PCX_OPENAPI);
+    SV *m  = pcx_get(aTHX_ av, PCX_MATCH);
+    if (op && SvROK(op) && SvTYPE(SvRV(op)) == SVt_PVHV) {
+        HV *oph = (HV *)SvRV(op);
+        static const char *loc[2] = { "path", "query" };
+        int i;
+        for (i = 0; i < 2; i++) {
+            SV **lv = hv_fetch(oph, loc[i], (I32)strlen(loc[i]), 0);
+            if (lv && *lv && SvROK(*lv) && SvTYPE(SvRV(*lv)) == SVt_PVHV) {
+                SV **v = hv_fetch((HV *)SvRV(*lv), n, (I32)nl, 0);
+                if (v) return *v ? *v : &PL_sv_undef;
+            }
+        }
+    }
+    if (m && SvROK(m) && SvTYPE(SvRV(m)) == SVt_PVHV) {
+        SV **cap = hv_fetchs((HV *)SvRV(m), "captures", 0);
+        if (cap && *cap && SvROK(*cap) && SvTYPE(SvRV(*cap)) == SVt_PVHV) {
+            SV **v = hv_fetch((HV *)SvRV(*cap), n, (I32)nl, 0);
+            if (v) return *v ? *v : &PL_sv_undef;
+        }
+    }
+    return NULL;
+}
+
+/* The lazy Punk::Request for this context, borrowed. */
+static SV *pcx_req(pTHX_ AV *av) {
+    return pcx_force(aTHX_ av, PCX_REQ, "Punk::Request",
+                     pcx_get(aTHX_ av, PCX_ENV));
+}
+
+/* $c->param($name): the layers above, else the request (query, then form
+ * body). Owned (+1), NULL when nothing carries the name. */
+static SV *pcx_param(pTHX_ AV *av, SV *name) {
+    SV *found = pcx_param_local(aTHX_ av, name);
+    SV *argv[1];
+    SV *r;
+    if (found) return newSVsv(found);
+    argv[0] = name;
+    r = pcx_call_meth(aTHX_ pcx_req(aTHX_ av), "param", argv, 1, 1);
+    if (r && SvOK(r)) return r;
+    if (r) SvREFCNT_dec(r);
+    return NULL;
+}
+
+/* Every parameter the context can see, stacked in the same precedence
+ * pcx_param resolves one by: the request's merged table underneath, then
+ * the route captures, then the validated OpenAPI query and path. +1. */
+static HV *pcx_params_merged(pTHX_ AV *av) {
+    HV *out = newHV();
+    SV *rp  = pcx_call_meth(aTHX_ pcx_req(aTHX_ av), "params", NULL, 0, 1);
+    SV *m   = pcx_get(aTHX_ av, PCX_MATCH);
+    SV *op  = pcx_get(aTHX_ av, PCX_OPENAPI);
+    pq_overlay(aTHX_ out, rp);
+    if (rp) SvREFCNT_dec(rp);
+    if (m && SvROK(m) && SvTYPE(SvRV(m)) == SVt_PVHV) {
+        SV **cap = hv_fetchs((HV *)SvRV(m), "captures", 0);
+        if (cap) pq_overlay(aTHX_ out, *cap);
+    }
+    if (op && SvROK(op) && SvTYPE(SvRV(op)) == SVt_PVHV) {
+        HV *oph  = (HV *)SvRV(op);
+        SV **qry = hv_fetchs(oph, "query", 0);
+        SV **pth = hv_fetchs(oph, "path", 0);
+        if (qry) pq_overlay(aTHX_ out, *qry);
+        if (pth) pq_overlay(aTHX_ out, *pth);
+    }
+    return out;
+}
+
+/* does the blessed ref have method $meth? (a ->can without the call) */
+/* Is this exactly a Punk::Future? A cached stash pointer compare, so the two
+ * dispatch paths can skip the ->can and ->isa probes they would otherwise pay
+ * per request. Deliberately not sv_derived_from: a subclass answers no and
+ * takes the general duck-typed path, which is the safe way round.
+ *
+ * pcx_pf_get1 is its companion - the value of a settled future, awaiting a
+ * pending one and croaking exactly as ->get does. It is defined in
+ * punk_future.h, which the unity build includes after this file. */
+static HV *PCX_PF_STASH = NULL;
+static int pcx_is_punk_future(pTHX_ SV *sv) {
+    if (!(SvROK(sv) && SvOBJECT(SvRV(sv)))) return 0;
+    if (!PCX_PF_STASH) PCX_PF_STASH = gv_stashpvs("Punk::Future", 0);
+    return PCX_PF_STASH && SvSTASH(SvRV(sv)) == PCX_PF_STASH;
+}
+static SV *pcx_pf_get1(pTHX_ SV *f);
+
+static int pcx_can(pTHX_ SV *obj, const char *meth) {
+    HV *stash = (SvROK(obj) && SvOBJECT(SvRV(obj))) ? SvSTASH(SvRV(obj)) : NULL;
+    return (stash && gv_fetchmethod_autoload(stash, meth, 0)) ? 1 : 0;
+}
+
+/* $h->($c, $resp) trapping a die; result (+1) or NULL, *died set. */
+static SV *pcx_call2(pTHX_ SV *h, SV *a, SV *b, int *died) {
+    dSP; SV *r; int count;
+    ENTER; SAVETMPS;
+    PUSHMARK(SP); EXTEND(SP, 2); PUSHs(a); PUSHs(b); PUTBACK;
+    count = call_sv(h, G_SCALAR | G_EVAL);
+    SPAGAIN;
+    r = count > 0 ? SvREFCNT_inc(POPs) : NULL;
+    PUTBACK; FREETMPS; LEAVE;
+    *died = SvTRUE(ERRSV) ? 1 : 0;
+    return r;
+}
+
+/* Is $ret already a PSGI triplet [ $status, \@headers, \@body ]? */
+static int pcx_is_triplet(pTHX_ SV *ret) {
+    AV *a;
+    SV **s, **h;
+    if (!SvROK(ret) || SvTYPE(SvRV(ret)) != SVt_PVAV) return 0;
+    a = (AV *)SvRV(ret);
+    if (av_len(a) != 2) return 0;
+    s = av_fetch(a, 0, 0);
+    h = av_fetch(a, 1, 0);
+    if (!(s && *s && SvOK(*s) && !SvROK(*s))) return 0;
+    if (!(h && *h && SvROK(*h) && SvTYPE(SvRV(*h)) == SVt_PVAV)) return 0;
+    /* the status Punk itself built is an integer: read it as one rather
+     * than upgrade it to a string on every response */
+    if (SvIOK(*s) && !SvPOK(*s)) {
+        IV v = SvIVX(*s);
+        return v >= 100 && v <= 599;
+    }
+    {
+        STRLEN l;
+        const char *p = SvPV_const(*s, l);
+        return (l == 3 && p[0] >= '1' && p[0] <= '5'
+                && isDIGIT(p[1]) && isDIGIT(p[2]));
+    }
+}
+
+/* A triplet in everything but its status: an integer first, then a headers
+ * arrayref of name and value pairs whose names are words, then a body that
+ * is an arrayref, a handle or an object. Narrow on purpose, because a
+ * handler may return three things that are simply data - [ 1, 2, 3 ],
+ * [ 'series', \@xs, \@ys ], [ 5, [ 1, 2 ], [ 3, 4 ] ] - and those must
+ * stay data. */
+static int pcx_triplet_shaped(pTHX_ SV *ret) {
+    AV *a, *hav;
+    SV **s, **h, **b;
+    SSize_t i, n;
+    if (!SvROK(ret) || SvTYPE(SvRV(ret)) != SVt_PVAV) return 0;
+    a = (AV *)SvRV(ret);
+    if (av_len(a) != 2) return 0;
+    s = av_fetch(a, 0, 0);
+    h = av_fetch(a, 1, 0);
+    b = av_fetch(a, 2, 0);
+    if (!(h && *h && SvROK(*h) && SvTYPE(SvRV(*h)) == SVt_PVAV)) return 0;
+    if (!(b && *b && SvROK(*b))) return 0;
+    if (!(SvTYPE(SvRV(*b)) == SVt_PVAV || SvTYPE(SvRV(*b)) == SVt_PVGV
+          || SvOBJECT(SvRV(*b)))) return 0;
+    /* An integer, asked WITHOUT numifying it: this value may yet be encoded
+     * as data, and SvIV or SvNV here would leave a number flag on the
+     * caller's scalar that changes how it is written - a 1 became 1.0. */
+    if (!(s && *s && SvOK(*s) && !SvROK(*s))) return 0;
+    if (!SvIOK(*s)) {
+        STRLEN sl, si = 0;
+        const char *sp;
+        if (!SvPOK(*s)) return 0;
+        sp = SvPVX_const(*s);
+        sl = SvCUR(*s);
+        if (sl && sp[0] == '-') si = 1;
+        if (si == sl) return 0;
+        for (; si < sl; si++) if (!isDIGIT(sp[si])) return 0;
+    }
+    hav = (AV *)SvRV(*h);
+    n = av_len(hav) + 1;
+    if (n == 0 || (n & 1)) return 0;
+    for (i = 0; i < n; i += 2) {
+        SV **k = av_fetch(hav, i, 0);
+        if (!(k && *k && SvOK(*k) && !SvROK(*k)) || looks_like_number(*k))
+            return 0;
+    }
+    return 1;
+}
+
+/* Coerce a handler return into a PSGI triplet: a triplet passes through, a
+ * Punk::Response finalizes, a Future is awaited and re-coerced, anything else
+ * is JSON-encoded (folding in the context's pending status/headers). +1. */
+/* The 500 envelope, or $on_error's own response. Defined in punk_serve.h,
+ * which is included later because it is the dispatcher and needs everything;
+ * it calls punk_coerce in turn, so one of the two has to be declared ahead of
+ * the other. Same arrangement as pk_after_res below. */
+static SV *punk_handle_error(pTHX_ SV *c, SV *err, SV *on_error);
+
+static SV *punk_coerce(pTHX_ SV *c, SV *ret) {
+    /* a coderef is a PSGI streaming / delayed-response body (SSE uses this on
+     * a psgi.streaming server) - hand it straight to the server */
+    if (SvROK(ret) && SvTYPE(SvRV(ret)) == SVt_PVCV) return SvREFCNT_inc(ret);
+    if (pcx_is_triplet(aTHX_ ret)) return SvREFCNT_inc(ret);
+    if (pcx_triplet_shaped(aTHX_ ret))
+        /* [ $something, \@headers, \@body ] where $something is not a
+         * status. That is a response somebody built wrongly, and encoding it
+         * as data would publish its headers - a Set-Cookie among them - in
+         * the body of a 200. An error says so instead. */
+        return punk_handle_error(aTHX_ c, sv_2mortal(newSVpvs(
+            "Punk: a handler returned a response whose status is not a "
+            "number from 100 to 599")), NULL);
+    if (SvROK(ret) && SvOBJECT(SvRV(ret))) {
+        /* One of ours: read the value in C rather than walking @ISA for
+         * Punk::Response and then dispatching ->get through perl. */
+        if (pcx_is_punk_future(aTHX_ ret)) {
+            SV *got = pcx_pf_get1(aTHX_ ret);
+            SV *r   = punk_coerce(aTHX_ c, got ? got : &PL_sv_undef);
+            if (got) SvREFCNT_dec(got);
+            return r;
+        }
+        if (sv_derived_from(ret, "Punk::Response"))
+        {
+            /* canonical JSON on an etag route, as pcx_json does for $c->json */
+            SV *canon = pcx_get(aTHX_ pcx_av(aTHX_ c), PCX_CANON);
+            SV *argv[1];
+            argv[0] = (canon && SvTRUE(canon)) ? &PL_sv_yes : &PL_sv_no;
+            return pcx_call_meth(aTHX_ ret, "finalize", argv, 1, 1);
+        }
+        /* An XML document, before the on_ready probe below (which walks the
+         * stash of every object) and before the JSON fallthrough (which would
+         * encode it as the blessed reference it is). This is also what makes
+         * respond_to(xml => sub { $doc }) answer application/xml: respond_to
+         * sets no type of its own, it returns whatever its branch returned. */
+        if (punk_xml_is(aTHX_ ret)) {
+            AV *res = pcx_res_av(aTHX_ pcx_av(aTHX_ c));
+            IV  st  = pcx_res_status(aTHX_ res);
+            SV *err = NULL;
+            SV *bytes = punk_xml_bytes(aTHX_ ret, &err);
+            /* write reports a refusal rather than croaking, which is what
+             * lets this be a branch: punk_coerce runs from loop callbacks
+             * with no eval around them, so a croak here would leave Punk
+             * instead of becoming a response. */
+            if (!bytes)
+                return punk_handle_error(aTHX_ c,
+                           err ? err : sv_2mortal(newSVpvs("Punk: xml")), NULL);
+            if (!st) st = 200;
+            return punk_triplet(aTHX_ st,
+                       sv_2mortal(newSVpvs(PK_XML_CT)),
+                       bytes, res ? pcx_res_headers(aTHX_ res) : NULL);
+        }
+        if (pcx_can(aTHX_ ret, "on_ready")) {
+            SV *got = pcx_call_meth(aTHX_ ret, "get", NULL, 0, 1);
+            SV *r   = punk_coerce(aTHX_ c, got ? got : &PL_sv_undef);
+            if (got) SvREFCNT_dec(got);
+            return r;
+        }
+    }
+    {
+        AV *res   = pcx_res_av(aTHX_ pcx_av(aTHX_ c));
+        IV  st    = pcx_res_status(aTHX_ res);
+        SV *bytes = pcx_json(aTHX_ pcx_av(aTHX_ c), ret);
+        if (!st) st = 200;
+        return punk_triplet_ct(aTHX_ st, "application/json", 16,
+                   bytes, res ? pcx_res_headers(aTHX_ res) : NULL);
+    }
+}
+
+/* The after_response phase: scheduled here because this is the one place a
+ * final response exists. Defined in punk_afterres.h, which is included after
+ * hm_abi.h because the loop timer is one of the three ways it defers - the
+ * pcg_check / pi_check arrangement. */
+static void pk_after_res(pTHX_ SV *c, SV *resp);
+
+/* Finish a response: coerce if needed, run the after-dispatch hooks (each may
+ * replace the triplet), and blank the body on HEAD. +1. */
+static SV *punk_deliver(pTHX_ SV *c, SV *resp, int is_head, AV *after) {
+    SV *r = pcx_is_triplet(aTHX_ resp) ? SvREFCNT_inc(resp)
+                                       : punk_coerce(aTHX_ c, resp);
+    /* a streaming coderef has no triplet to mutate: skip after-hooks and HEAD */
+    if (SvROK(r) && SvTYPE(SvRV(r)) == SVt_PVCV) {
+        if (PK_OBS_WANT_RES) pk_obs_fire_res(aTHX_ c, r);
+        pk_after_res(aTHX_ c, r);
+        return r;
+    }
+    if (after) {
+        SSize_t i, n = av_len(after) + 1;
+        for (i = 0; i < n; i++) {
+            SV **hp = av_fetch(after, i, 0);
+            int died = 0;
+            SV *hr;
+            if (!hp || !*hp) continue;
+            hr = pcx_call2(aTHX_ *hp, c, r, &died);
+            if (!died && hr && pcx_is_triplet(aTHX_ hr)) {
+                SvREFCNT_dec(r);
+                r = SvREFCNT_inc(hr);
+            }
+            if (hr) SvREFCNT_dec(hr);
+        }
+    }
+    if (is_head && SvROK(r) && SvTYPE(SvRV(r)) == SVt_PVAV) {
+        AV *ra = (AV *)SvRV(r);
+        SV **b = av_fetch(ra, 2, 0);
+        if (b && *b && SvROK(*b) && SvTYPE(SvRV(*b)) == SVt_PVAV) {
+            AV *empty = newAV();
+            av_push(empty, newSVpvs(""));
+            (void)av_store(ra, 2, newRV_noinc((SV *)empty));
+        }
+    }
+    /* The C ABI's response observers. Here rather than in the dispatcher
+     * because this is the ONE place a final triplet is produced: the
+     * synchronous path reaches it through punk_finish_c, and every
+     * asynchronous completion reaches it from punk_compile.h when the future
+     * settles - so an observer sees the response that was actually sent, at
+     * the moment it was, and sees it exactly once either way. The four
+     * dispatcher exits that never come through here fire it themselves. */
+    if (PK_OBS_WANT_RES) pk_obs_fire_res(aTHX_ c, r);
+    pk_after_res(aTHX_ c, r);
+    return r;
+}
+
+/* Is this a same-origin relative path - somewhere on this site, and nowhere
+ * else? Backs $c->safe_path, the guard for a redirect destination that came
+ * out of the request (?to=, ?return=, ?next=).
+ *
+ * Checking for a leading '/' and no leading '//' is NOT enough, because the
+ * browser does not read the string byte for byte the way this does:
+ *
+ *   - it removes every TAB, CR and LF from a URL before parsing it, so
+ *     "/<TAB>/evil.example" is parsed as "//evil.example";
+ *   - under a special scheme it treats '\' as '/', so "/\evil.example" is
+ *     protocol-relative too.
+ *
+ * Either one leaves the site, which is why this refuses the whole class -
+ * every C0 control, DEL, and a backslash anywhere - rather than trying to
+ * enumerate the bytes some parser somewhere might drop. The same rule (and
+ * the same reasoning) as Punk::OAuth2's same_origin_path, which is where it
+ * was learned the expensive way: CVE-2026-75628. A path that genuinely wants
+ * one of these spells it percent-encoded. */
+static int pk_same_origin_path(pTHX_ SV *path) {
+    STRLEN n, i;
+    const char *p;
+    if (!path || !SvOK(path)) return 0;
+    p = SvPV_const(path, n);
+    if (n < 1 || p[0] != '/') return 0;
+    if (n >= 2 && p[1] == '/') return 0;
+    for (i = 0; i < n; i++) {
+        const unsigned char ch = (unsigned char)p[i];
+        if (ch < 0x20 || ch == 0x7f || ch == '\\') return 0;
+    }
+    return 1;
+}
+
+#endif /* PUNK_CONTEXT_H */

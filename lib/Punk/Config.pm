@@ -1,0 +1,162 @@
+package Punk::Config;
+
+use 5.010;
+use strict;
+use warnings;
+use Punk ();
+
+our $VERSION = '0.67';
+
+# Capture a command's standard output. Called from C for { $exec: ... }; a
+# non-zero exit is fatal, so a broken secret store stops the boot rather than
+# yielding an empty password. A list is run directly. A single string is what
+# perl's piped open makes of one: run directly when it is plain words, handed
+# to the shell when it holds a shell metacharacter.
+sub _exec {
+    my (@cmd) = @_;
+    open my $ph, '-|', @cmd
+        or die "cannot run '$cmd[0]': $!\n";
+    my $out = do { local $/; <$ph> };
+    close $ph;
+    die "'$cmd[0]' exited with " . ($? >> 8) . "\n" if $?;
+    return defined $out ? $out : '';
+}
+
+1;
+
+__END__
+
+=head1 NAME
+
+Punk::Config - YAML configuration with secrets kept out of the file
+
+=head1 SYNOPSIS
+
+    # config/punk.yml - safe to commit
+    views:
+      Stencil:
+        template_dir: root/templates
+        wrapper: layout.tmpl
+
+    database:
+      dsn:      dbi:Pg:dbname=myapp;host=db
+      user:     myapp
+      password: { $env: DB_PASSWORD }
+
+    plugins:
+      RequestId: {}
+
+    # MyApp.pm
+    package MyApp;
+    use Punk;
+
+    config 'config/punk.yml';        # loads, applies, freezes
+
+    get '/' => 'Web::Book#home';
+
+=head1 DESCRIPTION
+
+Configuration is read once, at boot, from a YAML file; layered by
+environment; and applied to the application before C<to_app> freezes it.
+See L<Punk/config> for what the known blocks do.
+
+Implemented in C (F<include/punk/punk_config.h>): the layering, the deep
+merge, secret resolution and the redacted copy. Only YAML
+parsing (one L<YAML::XS> call per file) and the C<$exec> resolver's
+subprocess are Perl, both once per boot.
+
+=head2 Secrets
+
+A config file should say B<where> a secret comes from, never what it is.
+A reference is a single-key hash whose key starts with C<$> - a shape
+nothing else in a config has, and one that needs nothing from the parser:
+
+    password: { $env:     DB_PASSWORD }
+    password: { $file:    /run/secrets/db_password }
+    password: { $exec:    [ vault, read, -field=password, secret/db ] }
+    password: { $literal: not-actually-secret }
+
+C<$env> reads an environment variable (missing is fatal - better than
+starting with an empty password). C<$file> reads a file and trims one
+trailing newline, which is exactly how Docker and Kubernetes deliver
+secrets to a container. C<$exec> runs a command and takes its standard
+output, for Vault, C<aws secretsmanager>, C<op read> and friends; a
+non-zero exit is fatal. Give it a list, as above, and the command is run
+directly with those arguments and no shell. A single string is also
+accepted, and one that contains a shell metacharacter is run B<by the
+shell>: prefer the list. C<$literal> is an inline
+value spelled out as one, for a place where a reference would otherwise
+be expected.
+
+Resolved secrets are kept apart from the public structure:
+C<< $app->config >> has C<[redacted]> where each one was, so it can be
+logged, dumped or serialised safely, and C<< $app->secret($path) >>
+reaches the real value. Boot-time consumers are handed the real value
+directly, so a database password never sits in a general-purpose hash at
+all.
+
+=head2 Layering
+
+C<config/punk.yml> is read first, then C<config/punk.$PUNK_ENV.yml>
+(C<production> unless C<PUNK_ENV> says otherwise), then
+C<config/punk.local.yml>. Later layers win. Hashes merge key by key;
+anything else replaces, so an array in an overlay is a replacement rather
+than an append.
+
+Add C<punk.local.yml> to C<.gitignore>: it is the one place a developer
+may keep a throwaway value.
+
+=head1 METHODS
+
+=head2 load(file => $path, env => $name)
+
+Read, layer, resolve and validate. Croaks if no layer exists or if a
+reference cannot be resolved.
+
+Whether a value sits in the file in plaintext is the decision of
+whoever writes the file. Nothing here inspects a key's name to guess
+whether its value ought to have been a reference.
+
+=head2 config
+
+The public structure: secrets replaced by C<[redacted]>.
+
+=head2 resolved
+
+The same structure with the real values. What the boot consumers read.
+
+=head2 get($dotted_path)
+
+The resolved value at a path, secrets included.
+
+=head2 secret($dotted_path)
+
+=head2 has_secret($dotted_path)
+
+=head2 secret_paths
+
+The resolved secrets.
+
+=head2 env
+
+=head2 files
+
+The environment name, and the layers actually read.
+
+=head1 SEE ALSO
+
+L<Punk>, L<YAML::XS>.
+
+=head1 AUTHOR
+
+LNATION <email@lnation.org>
+
+=head1 LICENSE AND COPYRIGHT
+
+This software is Copyright (c) 2026 by LNATION <email@lnation.org>.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut

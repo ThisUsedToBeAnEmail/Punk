@@ -1,0 +1,979 @@
+Revision history for Punk
+
+0.67    2026-10-31
+        - Build and run on perls before 5.22, which lack Perl_isinfnan.
+        - Punk::Model::JSONFile locks with fcntl, so writers on Solaris no
+          longer lose rows.
+
+0.66    2026-10-23
+        - Add $c->escape_html to escape html
+
+0.65    2026-10-21
+        - Add Punk::Model::Computed, a base for read-only backends whose
+          rows are worked out from the question.
+        - Add Punk::Model::Computed::Error, a visitor's input error naming
+          its field.
+
+0.64    2026-10-21
+        - A controller that dies while loading names its error, not
+          "has no method".
+
+0.63    2026-10-21
+        - Requires Hyperman 0.64: on 0.60 to 0.63 a WebSocket's first
+          message over HTTP/2 was lost (t/1014 on Linux smokers).
+
+0.62    2026-10-19
+        - markdown: front matter reaches the templates as `meta`.
+        - markdown: the shipped wrapper writes description, canonical,
+          robots, Open Graph and Twitter tags from front matter; the origin
+          is the app's `host`, never the request.
+        - markdown: `date:`/`updated:` keys and `sort => 'date'`; a bad
+          date or an unknown `sort` croaks at boot.
+        - markdown: `vars` and `filters` options, for templates shared
+          with the rest of a site; `sitemap => 0`.
+        - markdown: a section index's `section:` and `section_order:` name
+          and place its sidebar group.
+        - `$app->markdown_pages($prefix)` lists a mount's pages.
+        - Sitemap lists markdown pages; `robots: noindex` leaves one out.
+        - Punk::Model::JSONFile: a model backend over a JSON file, read
+          and write.
+        - Punk::Model::Markdown: a read-only model backend over a markdown
+          mount's pages.
+        - A model backend's `new` receives the application as `app`.
+
+0.61    2026-10-17
+        - Fix: t/0317-static-dotfiles.t failed where two writes share one
+          inode stamp (Linux before 6.13).
+
+0.60    2026-10-16
+        - The compiled application is read into a C struct at `to_app`:
+          the request path no longer looks the router, hooks, mounts and
+          policies up by name, nor the matched route's fields, nor the
+          context class's stash. A dynamic route costs about 0.5us over a
+          bare PSGI app in-process, down from 0.9us.
+        - A static mount of Punk's own is served without the SCRIPT_NAME
+          and PATH_INFO rewrite or a Perl frame, and its ETag and
+          Last-Modified are formatted once per stat, not per hit.
+        - The session reads its cookie through the C parser; `rate_limit`
+          keeps the resolved ABI pointer instead of scanning the
+          environment per request (the `PUNK_NO_HM_ABI` switch is read
+          before the first request); the CSP policy is frozen around the
+          nonce; `headers` hands out its frozen list rather than copying
+          it; metrics keep the start time in a context slot.
+        - A WebSocket message in one frame is handed on from the read
+          buffer; ping and pong payloads are built only for a listener; a
+          room broadcast queues to each member in C; buffers that grew for
+          a large message shrink back once empty.
+        - SECURITY: `$f->get`, `$c->await` and the csrf check wrote to a
+          stale stack after running Perl.
+        - SECURITY: the OpenAPI mount validated a body it never read when
+          the request carried no Content-Length, and reserved a declared
+          length up front.
+        - SECURITY: a middleware editing a static body in place edited the
+          file cache, and every later hit served the edit.
+        - SECURITY: one WebSocket client could keep a worker to itself.
+        - SECURITY: a rate limit keyed on a header limited nothing when the
+          header was absent; it counts against the address.
+        - SECURITY: `database backend` and `$c->txn` loaded a class named in
+          config without checking it was a class name.
+
+0.59    2026-10-13
+        - SECURITY: a 500 outside `development` and `test` no longer
+          carries the die text; it is logged at error.
+        - SECURITY: the metrics `method` label is a known method or
+          `<other>`.
+        - SECURITY: a control character in a logged message, method or path
+          is written out; a newline forged a log record.
+        - SECURITY: a class named in `plugin`, `views`, a route target or a
+          model list must be a class name; anything else was evaluated.
+        - SECURITY: `punk new --api` and `punk api sync` refuse an
+          operationId that is not a Perl identifier.
+        - FIX: the I18n POD said `$c->locale` escapes substituted values.
+          It does not.
+        - FIX: a status outside 100 to 599 turned the response into a 200
+          JSON dump of itself, headers included. It now croaks.
+        - FIX: `logging to => '/path'` was a 500 on the first line logged.
+        - Add `$c->locale_html`, which escapes each substituted value.
+        - `redirect` croaks on a URL with CR, LF or NUL.
+        - `punk config check --dump` redacts inline credentials.
+        - Punk::Test sets PUNK_ENV to `test` when it is unset.
+        - `$w->drain` is pending over HTTP/2 from Hyperman 0.60.
+
+0.58    2026-10-13
+        - SECURITY: an Idempotency-Key replayed one resource's response for
+          another. The path and query string are now part of what a key is
+          checked against, and a mismatch is the 422.
+        - FIX: `Punk::Model::DBIx::Loop->await` used a stale stack pointer
+          after a callback grew the stack.
+        - FIX: a sparse `order_by` arrayref crashed the worker.
+        - FIX: a `limit` at or past the integer maximum became a negative
+          LIMIT.
+        - FIX: a page ending on a NULL in an `order_by` column ended the
+          walk.
+        - FIX: a retry arriving after the cache store's `lock_wait` ran
+          beside the request it was retrying.
+        - FIX: an idempotent request that won the lock did not look again
+          for a recorded answer.
+        - FIX: reading an expired file cache entry could delete a fresh one.
+        - Add the Idempotency `lock_wait` option, default 30 seconds.
+        - `get` and `delete` croak on a key that is not a field.
+        - The pooled DBI handle has `AutoInactiveDestroy`.
+        - `$c->validate` holds at most 256 compiled schemas.
+        - FIX t/1041-stream-handle.t on Linux smokers: the h2 body is its
+          own probe, and drain is asked of a client that does not read.
+        - Requires Hyperman 0.59, which sends an HTTP/2 stream body whole.
+
+0.57    2026-10-12
+        - SECURITY: an upload refused at `max_body` part way through left
+          its temp file, its descriptor and its buffers behind.
+        - SECURITY: `proxy trust => [networks]` took X-Forwarded-Proto,
+          -Host and -Port from a peer outside them.
+        - FIX: `$c->origin` leaked a string on every call.
+        - FIX: a request body is no longer allocated at its declared
+          Content-Length before it is read.
+        - FIX: a quoted `etag` validator is stripped of control bytes.
+        - FIX: `etag => 1` encodes JSON with its keys in order, so the tag
+          is the same in every worker.
+        - `header` croaks on a name or value with CR, LF or NUL.
+        - Add Punk::Upload `basename`.
+        - SECURITY: every WebSocket message a worker received stayed
+          allocated until the worker exited.
+        - SECURITY: a CR in an SSE `send` or `event` string started a new
+          field on the client.
+        - SECURITY: a `before_request` hook that answers a request no
+          longer answers an Extended CONNECT; that is the fixed 404.
+        - FIX: a WebSocket connection could be read after it was freed when
+          a close arrived on an HTTP/2 or TLS stream.
+        - FIX: `$w->drain` is pending on the stream handle while the server
+          is holding output; it was always settled.
+        - FIX: `broadcast($message, $except)` reaches every worker.
+        - FIX: a fast sender of small WebSocket messages was closed 1009.
+        - FIX: a self-rescheduling `defer` grew the worker on every tick.
+        - FIX: HEAD on an `sse` route or a `$c->stream` route sent a body.
+        - An SSE stream's write buffer is 16MB unless `write_buffer_limit`
+          says otherwise.
+        - A WebSocket frame length that is not minimal is a protocol error.
+        - `Upgrade` and `Connection` are matched as tokens.
+
+0.56    2026-10-11
+        - SECURITY: `$c->login` gives a stored session a new id. An id
+          planted in a browser before the login was signed in after it.
+        - SECURITY: an empty session that arrived with no cookie is not
+          written. Every anonymous guard denial and csrf refusal wrote a
+          store entry.
+        - FIX: `$c->logout->login($user)` signs the user in.
+        - FIX: csrf `exempt` matches whole path segments.
+        - FIX: cors sends `Vary: Origin` on a refused or originless response.
+        - The session and csrf cookies are `Secure` over https unless
+          `secure` is set.
+        - csrf no longer reads the form token from the query string.
+        - csrf checks a request with Basic, Digest, Negotiate or NTLM
+          `Authorization`.
+        - `login` croaks on an empty or 0 id.
+        - `auth_guard(verified => 1)` reads f, false, n, no and off as false.
+        - A cookie name, path, domain or samesite croaks on `;` or a control
+          character.
+        - Punk::Auth::Password refuses iterations outside 1000 to 10000000
+          and a stored key that is not 32 bytes.
+        - SECURITY: a markdown mount served drafts, index sources and
+          dotfiles as assets.
+        - SECURITY: `send_file` croaks on a path with a NUL, which opened
+          one file under another's content type.
+        - FIX: `send_file(etag => ...)` of 46 characters or more was a 500.
+        - FIX: `send_file` passes a weak `W/"..."` etag through.
+        - FIX: `blob_send` aborted the worker given eight or more options.
+        - FIX: a static file rewritten to the same size in the same second
+          was served stale, and one rewritten inside the stat TTL was sent
+          with the old Content-Length.
+        - FIX: directory listing links at the URL without a trailing slash.
+        - FIX: an empty If-None-Match no longer disables If-Modified-Since.
+        - A static mount answers 404 for a dotfile, `.well-known` excepted.
+        - Add the static `dotfiles` option.
+        - A file ETag carries the mtime's nanoseconds as a third field.
+
+0.55    2026-10-02
+        - SECURITY (CVE-2026-104380): an Extended CONNECT on HTTP/2 or
+          HTTP/3 was routed as a GET to any route, API operation or mount,
+          not only a `websocket` one, so a cross-origin page could read any
+          path's status as a websocket open or error. It now answers a
+          websocket route or a 404. Affects 0.48 to 0.54.
+        - ADDS: Punk::Test `request_ok($method, $path, %options)`.
+
+0.54    2026-09-22
+        - FIX: robots.txt carried the `*` group alone, and AdsBot-Google,
+          AdsBot-Google-Mobile and Mediapartners-Google ignore it.
+        - ADDS: Punk::Plugin::Sitemap `agents`, the user agents the disallow
+          list is repeated for.
+
+0.53    2026-09-20
+        - Requires Hyperman 0.51. A worker that could not claim a wakeup
+          descriptor installed no watch and never read the bus again, so
+          cross-worker cache invalidation and room broadcasts stopped
+          reaching it silently. That is what failed t/0810 on the smokers.
+        - t/0810 asserts the write request landed, so a failed request is no
+          longer indistinguishable from a pool that ignored the invalidation.
+
+0.52    2026-09-19
+        - FIX: the plural rule for a language tag was matched on the primary
+          subtag only, so pt-PT was given pt's rule.
+
+0.51    2026-09-17
+        - ADDS: websocket routes work over HTTP/1.1 on TLS. 
+        - FIX: csrf refused every websocket handshake over HTTP/2 and
+          HTTP/3 with 403 invalid csrf token. 
+
+0.50    2026-09-16
+        - ADDS: pk_abi v5, current_of - the context of the dispatch frame
+          running now, or NULL. on_query is handed no context and cannot
+          be given one, so a consumer had no way to attribute a statement
+          to the request that issued it. Saved and restored around the
+          frame: a continuation, a queue job or boot reads NULL, so the
+          degraded answer is "no context" and never somebody else's.
+        - ADDS: Punk::DBI, installed as the handle's RootClass when a query
+          observer is registered. on_query fired from the six generated
+          methods, a layer above the handle, so a statement run through
+          $model->backend->dbh was never seen. Now every statement is,
+          whichever way it was asked for. Nothing is installed when nobody
+          is listening, and never over an application's own RootClass.
+        - FIXES: pk_obs_query_start tested SvOK before applying get magic,
+          so a statement text read from a DBI handle arrived empty.
+
+0.49    2026-09-11
+        - ADDS: i18n catalogues are held in a Frozen block instead of an
+          arena built here. The block holds a tree, so a level and a leaf
+          are different nodes.
+        - FIXES: a literal key containing a dot and the nested form it
+          looks like were the same key, and which one answered was decided
+          by the hash order of the process that loaded it. Two workers in
+          one pool could serve different translations for the same key. A
+          dotted key is now a boot error.
+        - FIXES: a catalogue value that is not text no longer renders as
+          the key. null, an array and a boolean are boot errors naming the
+          path; numbers are stored as their digits and read back unchanged.
+        - FIXES: UTF-8 is preserved through interpolation. A substituted
+          value was appended as raw bytes into a string that was then
+          flagged UTF-8, so a non-ASCII entry plus a downgraded
+          substitution produced malformed output. Reachable from a form
+          field.
+        - FIXES: a catalogue from any producer keeps its encoding. Only the
+          JSON path was correct before, and only because that decoder
+          happens to decode to UTF-8.
+        - FIXES: the documentation described a language-switcher cookie
+          that was never implemented. Punk reads punk.lang and has never
+          written it; the POD now says so and shows the handler that does.
+        - ADDS: the locale hash can be iterated. keys, each and scalar used
+          to die. The order is the same in every process.
+        - BREAKING: _build takes catalogues that have been through
+          Frozen's builder; a catalogue key may not contain a dot; a
+          catalogue value must be text.
+        - Requires Frozen 0.06.
+
+0.48    2026-09-09
+        - ADDS: websocket routes work over HTTP/2 through Extended
+          CONNECT (RFC 8441). There is no 101, no Upgrade header and no
+          Sec-WebSocket-Key on a multiplexed transport, so the handshake
+          is new - but the RFC 6455 codec above it is the same one the
+          HTTP/1.1 path uses. An Extended CONNECT is routed as the GET
+          it stands in for, and the origin check still applies to it.
+        - ADDS: sse routes and $c->stream work over HTTP/2 and over TLS.
+          Both ran on Hyperman's detach, which hands over a file
+          descriptor and so refuses an h2 stream and a TLS session; they
+          now fall through to Hyperman's ABI v6 stream handle, which
+          sends status, headers and body pieces through the server.
+        - A stream reset by the peer, or a client that goes away, now
+          reaches the handler: an sse stream's close callback fires and a
+          $c->stream drain settles. HTTP/1 could only infer this from a
+          dead connection, and a multiplexed transport cannot.
+        - No Connection and no Transfer-Encoding on an HTTP/2 or HTTP/3
+          streamed response. Both are hop-by-hop and forbidden there.
+        - A refused detach falls through to the next transport instead of
+          answering 503.
+        - A die mid-stream truncates on the stream handle too, through
+          Hyperman's v7 stream_abort: RST_STREAM on HTTP/2, a connection
+          reset on TLS. A streamed body has no declared length, so ending
+          cleanly is the claim that it is whole.
+        - Requires Hyperman 0.45.
+
+0.47    2026-09-09
+        - FIXES: a request body with no CONTENT_LENGTH and no
+          Transfer-Encoding was read as no body at all. HTTP/2 and HTTP/3
+          forbid Transfer-Encoding, so that is every streamed h2 upload.
+          The read now keys off psgix.input.buffered, and HTTP/1 is
+          unchanged.
+        - FIXES: max_body imposed no ceiling on a request with no declared
+          length. It now bounds the read, for ->body, body_each, body_to
+          and the multipart streamer.
+        - FIXES: $c->stream chunk-framed every response that was not
+          literally HTTP/1.0, putting a Transfer-Encoding on HTTP/2 and
+          HTTP/3 responses, which forbid it. Only HTTP/1.1 is chunked now.
+        - Punk::Test's environment sets SERVER_PROTOCOL to HTTP/1.1,
+          overridable per request through `env`.
+
+0.46    2026-09-08
+        - ADDS: $c->req->xml - the request body parsed as XML through
+          File::Raw::XML's C ABI, as a File::Raw::XML::Document. The parse
+          is strict and takes no options: a DOCTYPE is refused wherever it
+          stands, so external entities, XXE and the billion laughs are not
+          reachable from a request. Parsed once per request.
+        - ADDS: $c->xml($doc, $status?) - a Document, a Node or a string of
+          markup as an application/xml response.
+        - FIXES: a File::Raw::XML::Document returned from a handler, or set
+          as a Punk::Response body, was JSON-encoded - it is a blessed
+          reference like any other. It is now written as markup, which is
+          also what makes respond_to(xml => sub { $doc }) answer
+          application/xml.
+        - Punk::Test takes `xml => $doc_or_string` as a request body and
+          answers ->xml with the parsed response.
+        - NOTE: $c->validate's `auto` source recognises only
+          application/json, so a schema on an XML POST validates the query
+          string rather than the body. Name the source to be sure of it.
+        - File::Raw::XML 0.03 is a new prerequisite.
+        - FIXES: the file cache's single-flight lock judged its holder's age
+          from whole-second st_mtime, so an age could read a second too high
+          and a `lock_wait` under a second was spent before it began 
+        - FIXES: a single-flight lock that could not be attempted at all - a
+          path that would not form - answered "you won", so every caller
+          computed and the herd ran unprotected with nothing said. It is
+          counted now and reported as `lock_errors` from the file store's
+          stats.
+        - t/0733-auth-sqitch.t asserted Sqitch's own deploy output, which is
+          translated - under LC_ALL=de_DE a successful deploy reports
+          "+ users ........ OK" and the test failed.
+
+0.45    2026-09-06
+        - A model class may now be subclassed: `package MyApp::Model::Thing;
+          our @ISA = ('Punk::Model::Thing');` inherits the parent's table and
+          fields, and `use Punk::Model` in the subclass lets it add a field,
+          redeclare one to change its spec, or name its own table.
+
+0.44    2026-09-05
+        - ADDS: $app->keyword($name => @args) and $app->has_keyword($name) -
+          call a keyword another plugin installed, from code, in the
+          caller's context
+
+0.43    2026-09-03
+        - SECURITY: a websocket upgrade is refused with 403 unless its
+          Origin is one the application answers as 
+        - ADDS: the `origin` websocket route option - a hostname, an
+          arrayref of them in `host allow` syntax, a coderef, or 0 to
+          serve any origin.
+        - ADDS: $c->req->body_each($cb) and $c->req->body_to($dest) - the
+          request body a window at a time, and straight to a file, for the
+          bodies that are not multipart. A body is read once: after either
+          of these, body/json/form croak rather than answer with nothing,
+          and a body already read whole is replayed from the copy.
+        - ADDS: the after_response phase - `hook after_response` and
+          $c->after_response($code), for work a request generates that the
+          client is not waiting for. 
+        - ADDS: the `rate_limit` route option - a budget for one route,
+          compiled into a guard at to_app and enforced by the same C the
+          keyword installs. Takes limit/window/by/tag, or a bare count.
+          The counter is namespaced to the route unless a tag shares one
+          between several, and the guard runs before `validate`, so a
+          refused request never parses a body.
+
+0.42    2026-09-02
+        - A blessed error raised from a future, a view or a websocket
+          handler arrived as a plain string on perls before 5.14. The
+          croak_sv shim had no branch for a reference.
+        - t/1002-awaitable.t and t/1050-asyncawait.t assert cancellation
+          across an await only on perl 5.24+, which is where
+          Future::AsyncAwait chains the awaited future rather than
+          registering a code block that reaches nothing.
+        - Both report the Future::AsyncAwait version they ran against.
+
+0.41    2026-09-01
+        - FIX: creating a future read an environment variable every time, so
+          a future-returning request cost 40% more on a host with a few
+          hundred of them than on one with a few dozen. The switch is read
+          once now.
+        - A handler that returns a Punk::Future is chained in C: one
+          continuation rather than three, and none of the ->can and ->isa
+          probes the general path needs. A future of any other class takes
+          that path unchanged.
+
+0.40    2026-09-01
+        - Punk::AsyncAwait: async and await in apps, controllers and models.
+        - Punk::Future implements the Future::AsyncAwait::Awaitable API, and
+          the future an async sub returns carries the loop it suspended on.
+        - Punk::Future->on_cancel, taking a code reference or a future.
+        - Punk::Future->result, the Future name for get.
+        - FIX: get in scalar context returned the last value, not the first.
+          A handler returning a multi-value future got its tail.
+        - FIX: a future method given an object of another class that is also
+          a blessed IV read the wrong struct instead of croaking.
+        - use Punk::Controller sets @ISA, strict and warnings; use parent
+          'Punk::Controller' is unchanged.
+
+0.39    2026-08-31
+        - Fix t/1113-idempotency-flight.t compares the recorded pid as a value,
+        which perl 5.16 spells as a string
+
+0.38    2026-08-31
+        - t/1040-stream.t drops its client on a stream with no end, so no
+          socket buffer can hold the whole body first
+
+0.37    2026-08-30
+        - $c->stream sends the real chunk length wherever perl expands
+          my_snprintf to a statement expression
+
+0.36    2026-08-30
+        - ADDS: $c->stream($content_type, $cb) + Punk::Stream - a response
+          body of unknown length on the SSE transports (Hyperman detach,
+          psgi.streaming, blocking psgix.io), chunk-framed on the socket
+          transports so a die is visible truncation, never a short success
+        - Punk::Stream drain - a Punk::Future settled when the write buffer
+          reaches the kernel; awaiting it after each write bounds memory to
+          one chunk while the worker keeps serving other requests
+        - Punk::Test declares psgi.streaming in every request env, so
+          get_ok drives a streamed route instead of collecting its 501
+        - ADDS: the `last_modified` route option - Punk::Plugin::
+          ConditionalGet's date validator, a coderef returning an epoch,
+          answered 304 before the handler runs; If-None-Match wins, the
+          date comparison is exact (the file path's convention), a future
+          epoch is clamped to now
+        - ADDS: Punk::Test `upload` - multipart/form-data requests: file
+          parts from a path or a scalar ref, streamed through one read
+          buffer however large, boundary verified absent from the content
+        - t/0410-upload.t posts through the client, so the encoder and the
+          streaming parser test each other
+        - ADDS: `max_record` on Punk::Plugin::Idempotency - a response
+          larger than it (default 1MB) is served with
+          Idempotency-Recorded: false and not stored; the single-flight
+          lock still covers the request
+        - ADDS: `signed => 1` on $c->cookie, both directions - HMAC over
+          name=value with the session's secret and verify, so a tampered,
+          swapped or unsigned cookie reads as undef
+
+0.35    2026-08-29
+        - An SSE heartbeat that finds the client gone no longer re-arms
+          itself on a stream it has just torn down.
+        - Freeing an SSE stream drops its loop watchers before its socket.
+        - t/0733-auth-sqitch.t skips unless `sqitch` is runnable, not
+          merely installed.
+        - t/1020-sse.t polls for the close rather than sleeping on it, and
+          reports what answered and which backend when it does not.
+
+0.34    2026-08-26
+        - ADDS: pk_abi v4 - on_log_ctx, a log tap that is handed the context
+          the line was logged against, so a telemetry layer can correlate a
+          record with its request. on_log is unchanged; a consumer registering
+          both receives every record twice.
+        - The logger resolves its context before running its observers.
+
+0.33    2026-08-25
+        - Static mounts hold small files in memory per worker, so a hit does
+          no file syscall
+
+0.32    2026-08-23
+        - ADDS: `punk serve [DIR]` - a directory of files over HTTP under
+          Hyperman, on 127.0.0.1:8000 by default
+        - ADDS: `index` and `list` options on Punk::Static, so the `static`
+          keyword serves a tree of index.html files
+        - Return _abi_ptr as a UV, not an IV.
+        - `punk doctor` loads every Punk::Command::* on @INC before it
+          prints, so a plugin distribution's register_doctor row appears
+          without that plugin's own command having been named first.
+        - REMOVES: the plaintext-secret guardrail in Punk::Config, and the
+          `secrets` option that set its mode. A value written into the
+          configuration file in plaintext is the decision of whoever writes
+          the file
+        - ADDS: $app->auth_config - the frozen auth configuration read back
+
+0.31    2026-08-23
+        - ADDS: kits. `punk new MyApp --kit diy` generates through
+          Punk::Kit::Diy instead of the basic skeleton
+        - A kit subclasses Punk::Generate, keeps its templates in skel/
+          beside its own module, and declares the options it takes, which
+          are read out of argv before Getopt runs so they parse and show
+          up under `punk new --kit NAME --help` like the command's own 
+        - ADDS: hook before_render. Runs once per $c->render, after
+          Punk's own binds (url, csp_nonce, locale), with the data
+          hashref the engine is about to receive - so a plugin can put a
+          value into every template without the handler passing it.
+        - ADDS: Punk::Command->load_app, the public form of what every
+          application-loading command does, for a command in another
+          distributio
+        - ADDS: $t->request_header in Punk::Test - a header on every
+          request from here on
+        - ADDS: named routes. A route takes { name => 'book' }, and
+          $c->url_for('book', id => 42) gives back its path 
+        - In a template, {% url.books %} for a static route and
+          {% row | url_for('book') %} for one with captures
+        - ADDS: `layout` as a render option. $c->render($tpl, \%data,
+          layout => undef) renders a template without the configured
+          wrapper
+        - ADDS: $c->fragment($tpl, \%data, %opts) - render with no layout
+          and Cache-Control: private
+        - ADDS: $app->databases - the configured databases read back, a
+          deep copy keyed by name with `default` for the unnamed one
+        - ADDS: $app->on_compile($code, $owner?) - a callback for to_app,
+          run in registration order after every keyword has recorded and
+          before anything is compiled
+        - ADDS: filter operators on Punk::Model search and count, on both
+          backends: = != < <= > >= in not_in like starts_with, as
+          { column => { op => value } } beside the plain equality.
+        - ADDS: order_by on search - a column, or [ column => 'asc'|'desc',
+          ... ] pairs 
+        - ADDS: count(\%filter) on the model and both backends.
+        - ADDS: $c->txn(sub { my ($tx) = @_; ... }) and $c->txn($database
+          => sub { ... }), with Punk::Txn
+
+0.30    2026-08-22
+        - `csrf: true`, `cors: true` and `headers: true` in punk.yml now
+          register.
+        - The config guardrail no longer flags a key that only names
+          where a secret lives: `token_model`, `password_field`,
+          `secret_path` - anything ending in _model, _class, _table,
+          _field, _column, _header, _cookie, _path, _dir, _name or
+          _kind - holds a model, a column or a location, not a secret.
+
+0.29    2026-08-22
+        - Punk::Plugin::Sitemap: a missing `base` now croaks at to_app
+          rather than at `plugin`
+        - ADDS: `host ..., allow => [...]` - the hosts that may stand in
+          for the canonical one, and $c->origin / $c->host_allowed: the
+          request's origin only when its Host is declared, the canonical
+          origin otherwise, never the raw header.
+        - ADDS: `favicon` - GET /favicon.ico from bytes frozen at
+          to_app, with Cache-Control, a strong ETag and 304s. A missing
+          file croaks at boot. Replaces the send_file boilerplate.
+        - `host` and `favicon` are now DSL keywords: an application
+          defining its own sub with either name sees a redefinition
+          warning at boot.
+        - Test fix: t/1011-ws-live.t and t/1030-room-bus.t read one
+          frame per sysread and threw away the rest of the buffer
+
+0.28    2026-08-21
+        - ADDS: Punk::Plugin::I18n - translations and language
+          negotiation. 
+        - REQUIRES Template::Stencil 0.10, for tied hashes in a path.
+          The `locale` hash is tied so a template lookup reads the
+          shared catalogue directly
+        - Punk::Cache single-flight fix: a loser that acquired the lock
+          after the winner finished went straight to computing without
+          looking again, so the herd computed twice.
+	- Improve test coverage
+
+0.27    2026-08-21
+        - Fix SEGV/BUS on every request carrying a session cookie
+        - t/0914-session-pool.t now names the signal when a forked
+          worker dies, instead of reporting four uninitialized values
+          and hiding the crash that caused them.
+
+0.26    2026-08-21
+        - `session store => ...` keeps the session server-side and the
+          cookie carries a signed 128-bit id.
+        - `$c->session_expire` now REVOKES a stored session: it deletes
+          the entry, so a cookie somebody copied is dead on its next
+          request. Without a store it is unchanged, and still can only
+          ask the browser in front of it to forget.
+        - `$c->session_rotate` keeps the session and gives it a new id,
+          deleting the old entry.
+        - `session sliding => 1` extends a stored session while it is
+          being used
+        - `session tier => $seconds` lets a stored session be read
+          through the cache's memory tier, which it otherwise goes
+          round. The number is how long a revoked session may keep
+          working on a worker that missed the invalidation, so it is
+          capped and checked against the store's own memory_ttl.
+
+0.25    2026-08-21
+        - Punk::Cache::stats no longer panics on a tiered store. The
+          XSUB asked the value stack for four fewer slots than it
+          pushes, which a DEBUGGING perl catches and turns into
+          "failed to extend arg stack",
+        - Punk::Plugin::Blob accepts a CODEREF `namespace` again. The
+          required-option check read the length of a scalar that has
+          no string body, which aborts a DEBUGGING perl outright.
+        - Punk::Plugin::Blob resolves Apophis on every perl. The ABI
+          pointer was popped with a macro that mentions its argument
+          twice, so it came off the wrong stack slot and the plugin
+          refused to load 
+        - Punk::Plugin::Metrics reports its numbers on a long double or
+          quadmath perl. 
+
+0.24    2026-08-20
+        - Large uploads no longer cost what they weigh. A
+          multipart part over 64KB is written to a temp file as it
+          arrives rather than copied into memory, and Punk::Upload
+          carries a `path` and an `fh` to it. Measured end to end
+          through a socket into a handler holding the upload, a 128MB
+          upload costs a worker 15.5MB of RSS against roughly 275MB
+          before.
+        - ADDS: the `upload_dir` keyword, naming where a large part is
+          spilled. It decides the filesystem, which decides whether
+          save() is a rename, and it decides what shares a filesystem
+          with attacker controlled bytes. Temp file names owe nothing
+          to the client's filename, and every file is removed when its
+          request ends.
+        - ADDS: Punk::Plugin::Blob stores an on-disk upload without reading
+          it into memory: hashed where it lies through Apophis's
+          identify_fh, then moved into the store.
+        - ADDS: Punk::Plugin::Idempotency - Idempotency-Key on unsafe
+          methods, replaying the stored response. 
+        - ADDS: Punk::Plugin::Metrics - a Prometheus /metrics endpoint
+        - ADDS: Punk::Plugin::Health - /healthz and /readyz, 
+        - ADDS: Punk::Plugin::CSP - Content-Security-Policy with a
+          per request nonce.
+        - ADDS: Punk::Plugin::ConditionalGet - ETags and 304s for
+          dynamic responses. 
+        - ADDS: Punk::Plugin::Blob, content addressed uploads on
+          Apophis. $c->blob_put stores by contents, so a user's filename
+          never becomes a filesystem path. $c->blob_send serves through
+          send_file as a download.
+        - ADDS: Apophis to the prerequisites.
+
+0.23    2026-08-20
+        - ADDS: Punk::Plugin::Sitemap sitemap.xml/robots.txt
+        - ADDS: static mounts can say how fresh a file is. `max_age`
+          and `cache_control` set Cache-Control on a plain URL, and
+          $c->send_file takes cache_control too.
+        - ADDS: content-addressed asset URLs. $c->asset('/static/app.css')
+          returns /static/app.9f3a1c2b0d4e5f60.css. The digest - the first 8
+          bytes of SHA-256 over the contents. 
+        - ADDS: Punk::Plugin::RequestId per request identifier
+
+0.22    2026-08-20
+        - ADDS: Punk::Plugin::Sitemap, phase 1 - which of an
+          application's routes are actually URLs. Punk compiles every
+          route at boot, so the application already holds a complete
+          list of what it serves, and a sitemap is that list with a
+          filter over it. A route is listed only when it is a GET, its
+          path holds no capture, it carries no guard, and it did not opt
+          out. Out is the safe direction: a page missing from a sitemap
+          is still crawled if anything links to it, while a page wrongly
+          present is a crawler fetching a 404 or a login redirect on a
+          schedule.
+          The part a hand-written sitemap cannot do: a page behind a
+          guard is excluded WITHOUT anyone maintaining a list, because
+          `under($prefix, $guard)` copies its guard chain into every
+          route declared inside it and the plugin reads it off the
+          record.
+          `base` is required and is configuration. The protocol wants
+          absolute URLs, and taking the host from the request would let
+          `Host: evil.example` produce a sitemap naming that host for
+          every page on the site - delivered to search engines, and
+          invisible to the owner, whose own request produces a correct
+          file.
+          New route option: `sitemap => 0` keeps a route out, and
+          `sitemap => 1` puts one in despite a guard, because a scope
+          guard may be an authentication check or an ordinary filter and
+          Punk cannot read which. The method and the shape are not
+          overridable - sitemap => 1 on a POST or on /users/:id is a
+          mistake rather than an instruction.
+          Rendering, dynamic sections and robots.txt are phases 2 to 4;
+          the plan is in plan_punk_sitemap/.
+        - FIX: change abi version checks from == to <=
+        - Adds: Punk::Cache, Punk::Cache::Memory and Punk::Cache::File
+
+0.21    2026-08-20
+        - FIX: A Punk::WebSocket::Room now reaches the whole pool.
+        - FIX: SSE also now works correctly accross workers.
+        - ADDS: $c->publish and $c->subscribe hyperman event bus hooks
+
+0.20    2026-08-19
+        - The dynamic-route path no longer requires Open::API. It
+          checked that api_mounts EXISTED rather than that it held
+          anything, and api_mounts is always present in the compiled
+          state - so an app that never declared an `api` still reached
+          the API branch on any route that was not a static hit, and
+          croaked there when Open::API's C ABI did not match.
+        - Punk publishes a C ABI of its own, pk_abi.h, installed through
+          ExtUtils::Depends and reached at runtime through
+          Punk::_abi_ptr. 
+
+0.19    2026-08-18
+        - SECURITY: a session had no server-side lifetime. `expires` set
+          only the cookie's Max-Age, which is a request to a client that
+          is free to ignore it - the signature carried no time at all, so
+          a cookie captured once (a shared machine, a log, a backup, a
+          proxy) stayed valid for as long as the secret did, and
+          session_expire only asked the browser to forget a value that
+          still authenticated. The expiry is now stamped inside the signed payload
+        - New $c->safe_path($path, $fallback?): returns the path when it
+          is same-origin and relative, otherwise the fallback. Punk had
+          no such guard while auth_guard hands every application a ?to=
+          to redirect to, which made the obvious login form an open
+          redirect. Same rules as Punk::OAuth2's same_origin_path, for
+          the same reasons (CVE-2026-75628)
+        - The static traversal guard splits segments on a backslash as
+          well as a slash. On POSIX "..\.." is one ordinary filename and
+          traverses nothing, but Windows reads it as a separator, so a
+          guard that split on "/" alone saw one harmless segment where
+          the OS would see two levels up. 
+        - New hook phase `before_request`, which runs BEFORE routing:
+
+            hook before_request => sub {
+                my ($c) = @_;
+                $c->stash->{t0} = Time::HiRes::time();
+                return;
+            };
+
+          The earliest phase until now was before_dispatch, which runs
+          only after the router has matched - so nothing could observe a
+          request from its start, and nothing ran at all for a 404, a
+          405, or anything answered by a PSGI or static mount.
+          before_request runs for all of those.
+        - The logger takes a record: a lone unblessed hashref is a set of
+          fields, and its `message` key is the message.
+
+            $c->log->info({ message => 'listing books',
+                            books => 12, user => $id });
+
+0.18    2026-08-18
+        A security release. issue reported by CPANSec.
+        - SECURITY (CVE-2026-75870): `session` declared without a secret
+          signed the cookie with an EMPTY HMAC key. The keyword froze
+          whatever options it was given without requiring a secret,
+          warning, or refusing to start, and both the cookie read and the
+          write-back defaulted that key to "". a secret is now required
+
+0.17    2026-08-17
+        - Fixed t/14-futures.t failing on every perl whose Future is
+          older than the one it was developed against - reported by
+          CPAN Testers against 0.16 on 5.20.0, 5.22.2 and 5.24.0 with
+          "Expected __ANON__(Future.pm line 1140) to return a Future".
+        - A route may now be declared as one hashref, with the handler
+          under `cb`:
+
+            post "/upload" => { cb => "Web::File#create",
+                                max_body => 50_000_000 };
+
+          instead of the positional form, which is unchanged and stays
+          the one `punk new` generates:
+
+            post "/upload" => "Web::File#create",
+                              { max_body => 50_000_000 };
+
+        - New route option { compress => 0 }, which opts a route out of
+          the server response compression Hyperman 0.25 adds. Punk does
+          not compress - that belongs to the write path - so the option
+          is spelled as a plain response header, Content-Encoding:
+          identity, which the server honours and strips. 
+        - New `max_body` keyword and per-route { max_body => N }: refuse
+          a request whose CONTENT_LENGTH is over a ceiling, with the
+          same 413 an oversize API operation gets. 
+        - Punk::Upload documents what an upload actually costs: it
+          arrives whole in memory before a handler sees it, ->save is a
+          write and not a stream, and `max_body` does not reduce the
+          memory.
+        - SECURITY: the `markdown` mount reflected the request path into
+          the Location header of its canonical 301 (the redirect that
+          strips a trailing slash or a .md suffix). PATH_INFO reaches a
+          PSGI app percent-DECODED, so that echoed bytes the client
+          chose: a decoded CR/LF split the response at any mount point,
+          and at a root mount "//evil.example/" came back as a
+          protocol-relative 301 off the site. Found while fixing the
+          same class of bug in Punk::OAuth2 (CVE-2026-75628).
+          The redirect now only names a path that IS a page - the
+          stripped target is looked up in the page table first - so the
+          only thing it can echo is one of the mount's own keys.
+          Anything else falls through to the 404 it was always going to
+          get. pmd_redirect also stops at the first control byte, in
+          case a mount prefix ever carries one.
+
+0.16    2026-08-17
+        - New `proxy` keyword: reverse-proxy trust. Behind nginx, an ELB
+          or a CDN, REMOTE_ADDR is the proxys on every request - and
+          because rate_limit's counters live in Hyperman's shared arena
+          they are exact across the whole worker pool, so every client
+          landed in ONE bucket and a limit => 100 rule throttled the
+          entire site at 100/min. block_ip, keyed the same way, it would ban
+          the load balancer. `proxy` resolves the real client at the
+          top of the dispatcher and OVERWRITES REMOTE_ADDR, so
+          rate_limit, block_ip, the access log and $c->req->address are
+          all correct with no change to any of them; the connecting
+          address stays as $c->env->{'punk.peer_addr'}.
+        - New $c->req->address: REMOTE_ADDR, which is the socket peer
+          directly exposed and the resolved client behind `proxy`.
+
+0.15    2026-08-17
+        - A trailing slash on the request path no longer 404s:
+          GET /account/ answers the route declared as GET /account.
+          The retry runs only after every declared route, API operation
+          and mount has missed, so nothing that already matched changes
+          - a *splat still captures its trailing slash, and a mounted
+          app is still handed the path it was sent, since only it knows
+          whether /docs and /docs/ differ. Repeated slashes collapse,
+          and "/" is left alone. A trimmed path that matches a
+          different method still answers 405 with its Allow list.
+
+0.14    2026-08-16
+        - Requires from the C layer go through pk_require_once (an %INC
+          check, then at most one eval per module per process) instead
+          of a bare eval_pv per call. Perl's own eval_sv spends immortal
+          references on every call on perls through 5.20 - whatever is
+          evaluated, success or failure - and before 5.20 the immortals'
+          refcounts are small and unprotected, so a path that
+          re-requires per build (the markdown mount ran two) drains
+          PL_sv_undef toward a segfault under punk dev's rebuild loop.
+          Found by t/42-immortal-refcount.t on a CPAN smoker running
+          perl 5.20.0; verified fixed on 5.20.3.
+        - t/37-ua.t pins the per-request agent clones it compares by
+          address: a freed clone's memory is the allocator's to hand
+          straight back, so two DEAD clones can legally compare equal,
+          which a smoker's malloc duly demonstrated. Held alive,
+          distinct objects must differ.
+
+0.13    2026-08-16
+        - $c->send_file($path_or_scalarref, %opts): a finished download
+          response
+        - Static files inherit the send_file core
+        - The punk command line rebuilt around a registry: commands are
+          specs (abstract, options with docs and defaults, nested verbs,
+          code), and help is generated from them 
+        - Plugin subcommands: Punk::Command->register($name => \%spec)
+          with owner-collision croaks; an unknown command gets one
+          require of Punk::Command::<Ucfirst>, whose load registers it
+        - In-process testing seam: $Punk::Command::OUT/$ERR replace the
+          streams and main() returns the exit code.
+        - routes: --method, --path GLOB, --kind, and --json.
+        - dev: --workers, --watch (repeatable), --env; one watch loop.
+        - console: a history file, --eval 'CODE', and q/exit.
+        - New commands: `generate controller|model` into an existing
+          application 
+
+0.12    2026-08-15
+        - Adds Punk::Auth. The `auth` keyword freezes the config at 
+	  to_app (model, a fields map so existing schemas need no renames, 
+          session_key, roles hook, rank ladder); croaks without a session, on any
+          unknown option, and on a roles target typo - at boot.
+        - Context surface: $c->login / logout / auth_id /
+          current_user (memoized per request, model loaded through an
+          await seam so the blocking DBI backend and the
+          future-returning DBIx::Loop backend both work).
+        - auth_guard for `under`: the bare is-anyone-signed-in form
+          runs entirely in C. Denial negotiates - a browser is
+          redirected to login_path with a relative-only ?to= return-to,
+          an API client gets the house 401 - with on_denied '403',
+          '404' or a coderef. The roles hook may return one role, a
+          list or an arrayref; a required role on the rank ladder means
+          "this or better", one outside it matches exactly (a staff
+          role next to tenant roles). Guards record what they learned
+          in $c->stash->{auth}.
+        - Bare `model;` registers everything under MyApp::Model::*
+
+0.11    2026-08-15
+        - Security response headers (Punk::Headers): a `headers` keyword
+          freezing a header policy at to_app, applied in C on the way
+          out of the dispatcher.
+        - Content negotiation ($c->respond_to): calls the handler for
+          the most acceptable offered format (json/html/text/xml or a
+          full media type) and returns its response. 
+
+0.10    2026-08-15
+        - Development error pages (Punk::DevError): in development a die
+          renders an HTML debug page
+        - The environment now defaults to production; development is an
+          opt-in: punk dev sets PUNK_ENV=development for its server, or
+          set it yourself in the Env.
+        - Punk::Validate: request validation, all in C on the
+          JSON::Schema::Fast C ABI. $c->validate($schema) collects into
+          a Result - errors in the Open::API shape plus name, valid()
+          hands back typed filtered params - and a bare $c->validate
+          reads the Result a route-level check stashed. Routes take an
+          options hashref: get '/x' => $target, { validate => \%schema }
+          (or { schema, source, on_invalid }), compiled once at to_app
+          and run as a C guard after any auth guards; failures answer
+          the OpenAPI-mount-shaped 400 or the on_invalid target.
+        - New on_not_found keyword: the on_error contract for a 404 so
+          you can return a custom response
+        - The getentropy probe now links instead of only compiling.
+          FreeBSD before 12 has no getentropy and its old compilers take
+          the implicit declaration as a warning, so 0.09's compile-only
+          probe false-positived and the .so failed to load with
+          "Undefined symbol getentropy".
+
+0.09    2026-08-15
+        - Adds Punk::Test, Punk::Test::WS and Punk::Test::WS::Conn
+        - Flash messages, in C (punk_flash.h): $c->flash and
+          $c->flash_keep over the session's reserved punk.flash key. 
+
+0.08    2026-08-14
+        - t/42-immortal-refcount.t failed the distribution on perl 5.18,
+          where perl itself moves the refcount it measures. Before 5.20
+          av_extend filled the slots it allocated with &PL_sv_undef and
+          av_undef released every slot up to the fill.
+
+0.07    2026-08-13
+        - The router stored &PL_sv_yes bare in three set-membership hashes
+        - New PUNK_SET_TRUE (include/punk/punk_compat.h) is the sanctioned
+          way to put a true value in a set slot - it takes the reference
+          first, so the container has one to spend, with no allocation.
+
+0.06    2026-08-13
+        - Rate limiting and IP blocking over Hyperman's shared arena
+          (requires Hyperman 0.18, ABI v3; fails open without it).
+        - New `rate_limit` keyword: installs a before_dispatch that answers
+          429 (with Retry-After and the X-RateLimit-* headers) when a
+          caller is over the limit. Key by client IP (default), a request
+          header (by => 'header:X-Api-Key'), or a coderef; scope to a path
+          prefix with `for`. Chainable for layered limits. The counters
+          live in the shared arena, so a limit is exact across the worker
+          pool rather than per worker.
+        - New context methods: $c->block_ip([$ip [, $ttl]]) and
+          $c->unblock_ip([$ip]) add or lift an IP on the edge denylist
+          ($ip defaults to the request's REMOTE_ADDR), and $c->rate_hit
+          for a raw counter check.
+
+0.05    2026-08-12
+        - Fixed a segfault on perl before 5.20. Six places handed one of
+          perl's immortal SVs to something that would release it.
+        - t/42-immortal-refcount.t asserts the invariant rather than the
+          symptom: an immortal's refcount may not move across these
+          calls. That fails on any perl, including the ones where the bug
+          is invisible.
+	- Update min version of deps
+
+0.04    2026-08-08
+        - Fixed the configure-time dependency declaration, which is why 
+          0.03 could not be installed from CPAN at all.
+        - $app->install_kw($name => $code, $owner?): a plugin can install
+          a declaration keyword of its own into the application class 
+          instead of assigning to a glob there.
+         - params now takes names: `$c->params(@names)` and `$req->params(@names)`
+           return just those, as a list of values in the order asked for, or - 
+           in scalar context - a hashref of only the names that were passed.
+
+0.03    2026-08-07
+        - Punk::Model::DBIx::Loop, a non-blocking model backend. The same
+          six-method contract, the same SQL and the same result shapes as
+          Punk::Model::DBI, but every method returns a Punk::Future and the
+          statement runs on DBIx::Loop over the worker's own event loop.
+        - It runs on DBIx::Loop's C ABI (dbil_abi.h, via ExtUtils::Depends)
+        - Fixed Punk::Model's delegation returning the caller's own
+          arguments alongside the backend's result.
+        - Punk::Model::DBI is ~40% faster per statement: quote_identifier
+          and the fixed-shape get/delete SQL are memoised on the pooled
+          connection instead of rebuilt every call. A get is 2.05us against
+          3.61us. The table is part of the statement cache key - the cache
+          is shared by every model on a dsn.
+        - Add the `markdown` mount/keyword: point it at a nested directory of .md
+          files and get a documentation site. Navigation reflecting the
+          tree, a per-page table of contents from the headings, syntax
+          highlighting, ranked search, and the images sitting alongside
+          the markdown served as static files.
+        - The site is built at boot. The tree is walked, every page is
+          rendered through Markdown::Simple and wrapped by
+          Template::Stencil, the search index is filled, and the finished
+          bytes are frozen. A request is then a hash lookup and a triplet,
+          with no markdown parse, no template render and no Perl frame.
+          `reload => 1` re-renders a page whose source has changed, for
+          the edit loop under `punk dev`.
+        - Refactor the stat / conditional-request / sendfile half of
+          punk_static.h out as ps_serve_file, so the markdown mount serves
+          the assets in its tree through the same code rather than a
+          second implementation that would drift from it.
+
+0.02    2026-08-06
+        - $c->ua: an outbound HTTP agent on the context
+        - The agent is one per worker, not one per request: it owns a
+          keep-alive pool and its DNS state.
+        - More than one agent: `ua partner => { ... }` names a second, the
+          same shape `database` uses for a second database, and
+          $c->ua('partner') asks for it. 
+        - Needs Fetch 0.11 for the per-request jar (Fetch->clone).
+
+0.01    2026-08-06
+        First version

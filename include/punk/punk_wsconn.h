@@ -1,0 +1,727 @@
+/* punk_wsconn.h - the live WebSocket connection.
+ *
+ * Drives the frame codec (punk_ws.h) over one socket the application owns
+ * after Hyperman::detach, watching it on the worker loop through Hyperman's
+ * C ABI (hm_abi.h, via ExtUtils::Depends). Reads, unmasks, reassembles,
+ * answers pings and runs the closing handshake entirely in C; Perl is
+ * entered only to deliver a completed message or a lifecycle event.
+ *
+ * The object is a blessed IV-ref to a punk_wsconn (the Punk::Router
+ * precedent - a C-buffer-heavy object rather than a slot AV). It holds a
+ * strong reference to itself while the socket is live, so a handler that
+ * wires callbacks and returns does not take the connection down with its
+ * lexicals; teardown drops it.
+ */
+
+#ifndef PUNK_WSCONN_H
+#define PUNK_WSCONN_H
+
+#define PW_ST_CONNECTING 0
+#define PW_ST_OPEN       1
+#define PW_ST_CLOSING    2
+#define PW_ST_CLOSED     3
+
+#define PW_DEFAULT_MAX_MESSAGE (16 * 1024 * 1024)
+#define PW_DEFAULT_WRITE_LIMIT (16 * 1024 * 1024)
+#define PW_READ_CHUNK          16384
+#define PW_CLOSE_TIMEOUT       10.0
+
+typedef struct punk_wsconn {
+    int    fd;
+    /* Extended CONNECT (RFC 8441 / RFC 9220): the connection rides an h2 or
+     * h3 STREAM rather than a socket, so there is no descriptor at all.
+     * When this is set, fd is meaningless: writes go through the stream
+     * handle and reads arrive by callback instead of from a read watcher.
+     * Everything above this line - the framing, masking, ping/pong, close
+     * handshake and UTF-8 validation - is unchanged, which is the whole
+     * reason the handshake and the codec were kept apart. */
+    void  *sh;
+    int    state;
+    int    blocking;              /* opt-in fallback: no loop, no watchers */
+    unsigned char reading, writing, close_sent, close_rcvd, in_teardown;
+
+    char  *rbuf; size_t rlen, rcap;
+    char  *wbuf; size_t wlen, woff, wcap;
+
+    char  *frag; size_t fraglen, fragcap;   /* message reassembly */
+    unsigned char frag_op, frag_active;
+    pw_utf8 utf8;                           /* across text fragments */
+
+    size_t max_message_size, write_buffer_limit;
+
+    uint16_t peer_code;
+    SV    *peer_reason;
+    SV    *protocol;
+    HV    *cbs;                   /* event name -> coderef */
+    SV    *self_rv;               /* strong self-ref while live */
+
+    void  *loop;                  /* hm_loop*, borrowed */
+    const hm_abi *abi;
+    hm_abi_timer *close_tw;
+} punk_wsconn;
+
+/* ---- Hyperman's ABI, resolved once (the punk_dispatch.h idiom) ----------- */
+
+static const hm_abi *PUNK_HM = NULL;
+static int PUNK_HM_TRIED = 0;
+
+/* NULL means "no detach seam": websocket routes then need blocking mode.
+ * PUNK_NO_HM_ABI forces that path for tests. */
+/* Once the table has resolved there is nothing left to decide, and the answer
+ * cannot change: the resolution is attempted exactly once. Callers on a hot
+ * path take this instead of punk_hm, because punk_hm's env check is a linear
+ * scan of the environment - unmeasurable with a handful of variables, and 40%
+ * of a future-returning request with the few hundred a container carries.
+ * Unresolved, this falls through to the full path, so the switch still works
+ * for the block-mode callers that read it per call. */
+static const hm_abi *punk_hm(pTHX);
+static const hm_abi *punk_hm_resolved(pTHX) {
+    return PUNK_HM ? PUNK_HM : punk_hm(aTHX);
+}
+
+static const hm_abi *punk_hm(pTHX) {
+    if (getenv("PUNK_NO_HM_ABI")) return NULL;
+    if (!PUNK_HM_TRIED) {
+        dSP; int count, ok; IV p = 0;
+        PUNK_HM_TRIED = 1;
+        ok = pk_require_once(aTHX_ "Hyperman", FALSE);
+        SPAGAIN;   /* the require may have reallocated the value stack */
+        if (ok) {
+            ENTER; SAVETMPS; PUSHMARK(SP); PUTBACK;
+            count = call_pv("Hyperman::_abi_ptr", G_SCALAR | G_EVAL);
+            SPAGAIN;
+            if (!SvTRUE(ERRSV) && count > 0) p = POPi;
+            else if (count > 0)             (void)POPs;
+            PUTBACK; FREETMPS; LEAVE;
+            if (p) {
+                const hm_abi *a = INT2PTR(const hm_abi *, p);
+                /* >= : the table only grows at its tail, so a later
+                 * Hyperman still satisfies what we compiled against */
+                if (a && a->abi_version >= HM_ABI_VERSION) PUNK_HM = a;
+            }
+        }
+    }
+    return PUNK_HM;
+}
+
+/* Open a Hyperman stream handle for this request, or NULL.
+ *
+ * The ticket is psgix.hyperman.stream: [fd, generation, stream id], which
+ * unlike psgix.hyperman.conn is present on HTTP/2 - there is no fd that means
+ * "this stream", but there is a stream id, and that is the whole reason the
+ * seam is a handle rather than a descriptor.
+ *
+ * NULL when the server is not Hyperman, when the ticket names a connection
+ * that has gone, or when the response has not been deferred yet (an HTTP/1.1
+ * handler that has not returned would have its return value serialised on top
+ * of the streamed body). Every caller falls through to the transport it would
+ * have used, so a NULL here is a choice of transport and never an error.
+ *
+ * No version check: punk_hm already refuses a table older than the header
+ * this was compiled against, so a resolved table has the v6 entries. */
+static void *punk_hm_stream_open(pTHX_ HV *envh, const hm_abi **out_abi,
+                                 void **out_loop, int status, AV *hdrs) {
+    SV **t = envh ? hv_fetchs(envh, "psgix.hyperman.stream", 0) : NULL;
+    const hm_abi *A;
+    AV *tick;
+    SV **fsv, **isv, **ssv;
+    void *loop, *h;
+    if (!(t && *t && SvROK(*t) && SvTYPE(SvRV(*t)) == SVt_PVAV)) return NULL;
+    A = punk_hm(aTHX);
+    if (!A) return NULL;
+    tick = (AV *)SvRV(*t);
+    fsv = av_fetch(tick, 0, 0);
+    isv = av_fetch(tick, 1, 0);
+    ssv = av_fetch(tick, 2, 0);
+    if (!(fsv && *fsv && isv && *isv)) return NULL;
+    loop = A->cur_loop(aTHX);
+    if (!loop) return NULL;
+    h = A->stream_open(aTHX_ loop, (int)SvIV(*fsv), SvUV(*isv),
+                       (ssv && *ssv) ? (int64_t)SvIV(*ssv) : -1,
+                       status, sv_2mortal(newRV_inc((SV *)hdrs)));
+    if (!h) return NULL;
+    *out_abi  = A;
+    *out_loop = loop;
+    return h;
+}
+
+/* ---- small buffer helpers ------------------------------------------------ */
+
+/* a buffer bigger than this is returned once it is empty */
+#define PW_BUF_KEEP (64 * 1024)
+
+static void pw_buf_reserve(char **buf, size_t *cap, size_t need) {
+    if (*cap >= need) return;
+    {
+        size_t n = *cap ? *cap : 1024;
+        while (n < need) n *= 2;
+        *buf = (char *)realloc(*buf, n);
+        if (!*buf) croak("Punk::WebSocket: out of memory");
+        *cap = n;
+    }
+}
+
+static void pw_append(char **buf, size_t *len, size_t *cap,
+                      const char *src, size_t n) {
+    pw_buf_reserve(buf, cap, *len + n);
+    memcpy(*buf + *len, src, n);
+    *len += n;
+}
+
+/* ---- event dispatch ------------------------------------------------------
+ * The ABI contract is that C callbacks must not croak, so every call into
+ * Perl is trapped. A handler that dies surfaces as the error event and
+ * closes the connection with 1011. */
+
+static void pw_queue_frame(pTHX_ punk_wsconn *ws, unsigned char op,
+                           const char *payload, size_t len);
+static void pw_fail(pTHX_ punk_wsconn *ws, uint16_t code, const char *why);
+static void pw_teardown(pTHX_ punk_wsconn *ws, uint16_t code,
+                        const char *reason, size_t rlen);
+static void pw_flush(pTHX_ punk_wsconn *ws);
+
+static SV *pw_cb(pTHX_ punk_wsconn *ws, const char *name) {
+    SV **e;
+    if (!ws->cbs) return NULL;
+    e = hv_fetch(ws->cbs, name, (I32)strlen(name), 0);
+    return (e && *e && SvROK(*e)) ? *e : NULL;
+}
+
+/* Fire an event with (self, @args). Returns 0 if a handler died. */
+static int pw_emit(pTHX_ punk_wsconn *ws, const char *name,
+                   SV **args, int nargs) {
+    SV *cb = pw_cb(aTHX_ ws, name);
+    dSP;
+    int i, died;
+    if (!cb) return 1;
+    ENTER; SAVETMPS;
+    PUSHMARK(SP);
+    EXTEND(SP, nargs + 1);
+    PUSHs(ws->self_rv ? ws->self_rv : &PL_sv_undef);
+    for (i = 0; i < nargs; i++) PUSHs(args[i]);
+    PUTBACK;
+    call_sv(cb, G_DISCARD | G_EVAL);
+    SPAGAIN;
+    died = SvTRUE(ERRSV) ? 1 : 0;
+    if (died) {
+        SV *err = newSVsv(ERRSV);
+        SV *ecb = pw_cb(aTHX_ ws, "error");
+        if (ecb && strNE(name, "error")) {
+            PUSHMARK(SP);
+            EXTEND(SP, 2);
+            PUSHs(ws->self_rv ? ws->self_rv : &PL_sv_undef);
+            PUSHs(sv_2mortal(err));
+            PUTBACK;
+            call_sv(ecb, G_DISCARD | G_EVAL);
+            SPAGAIN;
+            (void)SvTRUE(ERRSV);      /* an error handler that dies: give up */
+        }
+        else {
+            STRLEN el; const char *ep = SvPV_const(err, el);
+            /* escaped: a die text is request-shaped, and a newline in it
+             * would be a second log line */
+            PerlIO_printf(PerlIO_stderr(),
+                          "Punk::WebSocket: %s handler died: %" SVf "\n",
+                          name, SVfARG(pl_plain(aTHX_ ep, el, SvUTF8(err))));
+            SvREFCNT_dec(err);
+        }
+    }
+    PUTBACK;
+    FREETMPS; LEAVE;
+    return !died;
+}
+
+/* ---- writing -------------------------------------------------------------
+ * Everything queues; pw_flush drains what the socket will take and arms a
+ * write watcher for the rest. A peer that will not read cannot stall the
+ * worker, and cannot make us drop bytes mid-frame either. */
+
+static void pw_on_writable(pTHX_ int fd, int mask, void *ud);
+
+static void pw_flush(pTHX_ punk_wsconn *ws) {
+    if (ws->sh) {
+        /* The server owns the framing and the backpressure here, so this is
+         * a hand-off rather than a write loop: there is no partial write to
+         * resume and no write watcher to arm. */
+        if (ws->woff < ws->wlen && ws->abi) {
+            int r = ws->abi->stream_write(aTHX_ ws->sh, ws->wbuf + ws->woff,
+                                          ws->wlen - ws->woff);
+            if (r < 0) { pw_teardown(aTHX_ ws, PW_CLOSE_ABNORMAL, NULL, 0); return; }
+            ws->woff = ws->wlen;
+        }
+        ws->wlen = ws->woff = 0;
+        if (ws->state == PW_ST_CLOSING && ws->close_sent && ws->close_rcvd)
+            pw_teardown(aTHX_ ws, 0, NULL, 0);
+        return;
+    }
+    while (ws->woff < ws->wlen) {
+        ssize_t n = write(ws->fd, ws->wbuf + ws->woff, ws->wlen - ws->woff);
+        if (n > 0) { ws->woff += (size_t)n; continue; }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (!ws->writing && !ws->blocking && ws->abi && ws->loop) {
+                ws->abi->io_watch(aTHX_ ws->loop, ws->fd, HM_ABI_WRITE,
+                                  pw_on_writable, ws);
+                ws->writing = 1;
+            }
+            return;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        pw_teardown(aTHX_ ws, PW_CLOSE_ABNORMAL, NULL, 0);   /* write error */
+        return;
+    }
+    ws->wlen = ws->woff = 0;
+    if (ws->writing && ws->abi && ws->loop) {
+        ws->abi->io_unwatch(aTHX_ ws->loop, ws->fd, HM_ABI_WRITE);
+        ws->writing = 0;
+    }
+    /* the closing handshake is done once our close frame is on the wire */
+    if (ws->state == PW_ST_CLOSING && ws->close_sent && ws->close_rcvd)
+        pw_teardown(aTHX_ ws, 0, NULL, 0);
+}
+
+static void pw_on_writable_in(pTHX_ int fd, int mask, void *ud) {
+    punk_wsconn *ws = (punk_wsconn *)ud;
+    PERL_UNUSED_ARG(fd); PERL_UNUSED_ARG(mask);
+    pw_flush(aTHX_ ws);
+}
+
+static void pw_on_writable(pTHX_ int fd, int mask, void *ud) {
+    punk_wsconn *ws_ = (punk_wsconn *)ud;
+    SV *keep = ws_->self_rv ? SvREFCNT_inc(ws_->self_rv) : NULL;
+    PK_LOOP_ENTER;
+    pw_on_writable_in(aTHX_ fd, mask, ud);
+    PK_LOOP_LEAVE;
+    if (keep) SvREFCNT_dec(keep);      /* ws may be gone after this */
+}
+
+static void pw_queue_frame(pTHX_ punk_wsconn *ws, unsigned char op,
+                           const char *payload, size_t len) {
+    char hdr[10];
+    size_t hn;
+    if (ws->state == PW_ST_CLOSED) return;
+    if (ws->write_buffer_limit
+        && ws->wlen - ws->woff + len > ws->write_buffer_limit) {
+        pw_fail(aTHX_ ws, PW_CLOSE_POLICY_VIOLATION, "send buffer full");
+        return;
+    }
+    hn = pw_encode_header(hdr, op, 1, len);
+    pw_append(&ws->wbuf, &ws->wlen, &ws->wcap, hdr, hn);
+    if (len) pw_append(&ws->wbuf, &ws->wlen, &ws->wcap, payload, len);
+    pw_flush(aTHX_ ws);
+}
+
+static void pw_queue_close(pTHX_ punk_wsconn *ws, uint16_t code,
+                           const char *reason, size_t rlen) {
+    char body[2 + PW_MAX_REASON];
+    size_t blen;
+    if (ws->close_sent || ws->state == PW_ST_CLOSED) return;
+    blen = pw_close_payload(body, code, reason, rlen);
+    ws->close_sent = 1;
+    if (ws->state == PW_ST_OPEN) ws->state = PW_ST_CLOSING;
+    pw_queue_frame(aTHX_ ws, PW_OP_CLOSE, body, blen);
+}
+
+/* A protocol failure: tell the peer why, then close. */
+static void pw_fail(pTHX_ punk_wsconn *ws, uint16_t code, const char *why) {
+    if (ws->state == PW_ST_CLOSED || ws->in_teardown) return;
+    {
+        SV *msg = sv_2mortal(newSVpv(why ? why : "protocol error", 0));
+        SV *a[1]; a[0] = msg;
+        (void)pw_emit(aTHX_ ws, "error", a, 1);
+    }
+    pw_queue_close(aTHX_ ws, code, why, why ? strlen(why) : 0);
+    /* do not wait for the peer's echo after a protocol failure */
+    pw_teardown(aTHX_ ws, code, why, why ? strlen(why) : 0);
+}
+
+/* ---- teardown ------------------------------------------------------------ */
+
+static void pw_teardown(pTHX_ punk_wsconn *ws, uint16_t code,
+                        const char *reason, size_t rlen) {
+    SV *args[2];
+    if (ws->in_teardown || ws->state == PW_ST_CLOSED) return;
+    ws->in_teardown = 1;
+
+    if (ws->abi && ws->loop && !ws->blocking) {
+        if (ws->reading) ws->abi->io_unwatch(aTHX_ ws->loop, ws->fd, HM_ABI_READ);
+        if (ws->writing) ws->abi->io_unwatch(aTHX_ ws->loop, ws->fd, HM_ABI_WRITE);
+        if (ws->close_tw) {
+            ws->abi->timer_cancel(aTHX_ ws->loop, ws->close_tw);
+            ws->close_tw = NULL;
+        }
+    }
+    ws->reading = ws->writing = 0;
+    if (ws->sh) {
+        /* Stream-backed: there is no descriptor to close, and the server
+         * owns the stream. Releasing the handle is what ends it - and it
+         * has to happen exactly once, so the pointer is cleared first. */
+        void *h = ws->sh;
+        ws->sh = NULL;
+        if (ws->abi) (void)ws->abi->stream_close(aTHX_ h);
+    }
+    if (ws->fd >= 0) { close(ws->fd); ws->fd = -1; }
+    ws->state = PW_ST_CLOSED;
+
+    args[0] = sv_2mortal(newSViv(ws->peer_code ? ws->peer_code : code));
+    args[1] = ws->peer_reason ? sv_2mortal(newSVsv(ws->peer_reason))
+            : sv_2mortal(rlen ? newSVpvn(reason, rlen) : newSVpvs(""));
+    (void)pw_emit(aTHX_ ws, "close", args, 2);
+
+    if (ws->cbs) { SvREFCNT_dec((SV *)ws->cbs); ws->cbs = NULL; }
+    ws->in_teardown = 0;
+    /* drop the self-reference last: this may free the object */
+    if (ws->self_rv) { SV *s = ws->self_rv; ws->self_rv = NULL; SvREFCNT_dec(s); }
+}
+
+static void pw_close_timeout_in(pTHX_ void *ud) {
+    punk_wsconn *ws = (punk_wsconn *)ud;
+    ws->close_tw = NULL;
+    pw_teardown(aTHX_ ws, PW_CLOSE_ABNORMAL, "close timeout", 13);
+}
+
+static void pw_close_timeout(pTHX_ void *ud) {
+    punk_wsconn *ws_ = (punk_wsconn *)ud;
+    SV *keep = ws_->self_rv ? SvREFCNT_inc(ws_->self_rv) : NULL;
+    PK_LOOP_ENTER;
+    pw_close_timeout_in(aTHX_ ud);
+    PK_LOOP_LEAVE;
+    if (keep) SvREFCNT_dec(keep);      /* ws may be gone after this */
+}
+
+/* ---- reading -------------------------------------------------------------
+ * One pass over everything buffered: control frames are answered inline,
+ * data frames reassemble into ws->frag until FIN. */
+
+static void pw_process(pTHX_ punk_wsconn *ws) {
+    size_t off = 0;
+    /* Teardown drops the connection's self-reference, which can free the
+     * struct while we are still inside this loop (a close frame, or any
+     * protocol failure, does exactly that). Hold a reference for the
+     * duration so the tail of this function - and our caller - still have
+     * something to look at; the object goes away when this guard does. */
+    SV *guard = ws->self_rv ? SvREFCNT_inc(ws->self_rv) : NULL;
+    while (ws->state != PW_ST_CLOSED && off < ws->rlen) {
+        pw_frame f;
+        int n = pw_decode_frame(ws->rbuf + off, ws->rlen - off, &f,
+                                ws->max_message_size, 1);
+        if (n == PW_NEED_MORE) break;
+        if (n == PW_E_PROTO) {
+            pw_fail(aTHX_ ws, PW_CLOSE_PROTOCOL_ERROR, "protocol error");
+            goto consumed;
+        }
+        if (n == PW_E_TOO_BIG) {
+            pw_fail(aTHX_ ws, PW_CLOSE_MESSAGE_TOO_BIG, "message too big");
+            goto consumed;
+        }
+        pw_unmask(&f, ws->rbuf + off + f.header_size);
+        {
+            const char *pl = ws->rbuf + off + f.header_size;
+            size_t      pn = (size_t)f.payload_len;
+
+            if (pw_is_control(f.opcode)) {
+                if (f.opcode == PW_OP_PING) {
+                    pw_queue_frame(aTHX_ ws, PW_OP_PONG, pl, pn);
+                    /* the payload SV only when somebody listens */
+                    if (pw_cb(aTHX_ ws, "ping")) {
+                        SV *a[1]; a[0] = newSVpvn(pl, pn);
+                        (void)pw_emit(aTHX_ ws, "ping", a, 1);
+                        SvREFCNT_dec(a[0]);
+                    }
+                }
+                else if (f.opcode == PW_OP_PONG) {
+                    if (pw_cb(aTHX_ ws, "pong")) {
+                        SV *a[1]; a[0] = newSVpvn(pl, pn);
+                        (void)pw_emit(aTHX_ ws, "pong", a, 1);
+                        SvREFCNT_dec(a[0]);
+                    }
+                }
+                else {   /* close */
+                    uint16_t code = PW_CLOSE_NO_STATUS;
+                    if (pn == 1) {
+                        pw_fail(aTHX_ ws, PW_CLOSE_PROTOCOL_ERROR,
+                                "bad close payload");
+                        goto consumed;
+                    }
+                    if (pn >= 2) {
+                        code = (uint16_t)(((unsigned char)pl[0] << 8)
+                                        | (unsigned char)pl[1]);
+                        if (!pw_close_code_ok(code)) {
+                            pw_fail(aTHX_ ws, PW_CLOSE_PROTOCOL_ERROR,
+                                    "bad close code");
+                            goto consumed;
+                        }
+                        if (pn > 2 && !pw_utf8_valid(pl + 2, pn - 2)) {
+                            pw_fail(aTHX_ ws, PW_CLOSE_INVALID_PAYLOAD,
+                                    "close reason is not utf8");
+                            goto consumed;
+                        }
+                    }
+                    ws->close_rcvd = 1;
+                    ws->peer_code  = code;
+                    if (ws->peer_reason) SvREFCNT_dec(ws->peer_reason);
+                    ws->peer_reason = pn > 2 ? newSVpvn(pl + 2, pn - 2)
+                                             : newSVpvs("");
+                    SvUTF8_on(ws->peer_reason);
+                    if (!ws->close_sent)
+                        pw_queue_close(aTHX_ ws, code == PW_CLOSE_NO_STATUS
+                                       ? PW_CLOSE_NORMAL : code, NULL, 0);
+                    off += (size_t)n;
+                    /* everything queued is flushed by pw_queue_close ->
+                     * pw_flush, which tears down once it drains */
+                    if (ws->wlen == ws->woff)
+                        pw_teardown(aTHX_ ws, code, NULL, 0);
+                    goto consumed;
+                }
+            }
+            else {   /* data */
+                unsigned char op = f.opcode;
+                if (op == PW_OP_CONT) {
+                    if (!ws->frag_active) {
+                        pw_fail(aTHX_ ws, PW_CLOSE_PROTOCOL_ERROR,
+                                "continuation without a start frame");
+                        goto consumed;
+                    }
+                }
+                else {
+                    if (ws->frag_active) {
+                        pw_fail(aTHX_ ws, PW_CLOSE_PROTOCOL_ERROR,
+                                "new data frame inside a fragmented message");
+                        goto consumed;
+                    }
+                    ws->frag_active = 1;
+                    ws->frag_op     = op;
+                    ws->fraglen     = 0;
+                    pw_utf8_reset(&ws->utf8);
+                }
+                if (ws->max_message_size
+                    && ws->fraglen + pn > ws->max_message_size) {
+                    pw_fail(aTHX_ ws, PW_CLOSE_MESSAGE_TOO_BIG,
+                            "message too big");
+                    goto consumed;
+                }
+                /* validate text as it arrives, so a split multibyte
+                 * character is judged on the whole message, not a fragment */
+                if (ws->frag_op == PW_OP_TEXT
+                    && !pw_utf8_step(&ws->utf8, pl, pn)) {
+                    pw_fail(aTHX_ ws, PW_CLOSE_INVALID_PAYLOAD,
+                            "text is not utf8");
+                    goto consumed;
+                }
+                /* One frame that is the whole message - nearly every one -
+                 * is handed on straight from the read buffer; only a
+                 * fragmented message is gathered in `frag` first. */
+                {
+                    int whole = f.fin && ws->fraglen == 0;
+                    if (pn && !whole)
+                        pw_append(&ws->frag, &ws->fraglen, &ws->fragcap, pl, pn);
+
+                    if (f.fin) {
+                        int is_text = (ws->frag_op == PW_OP_TEXT);
+                        if (is_text && !pw_utf8_ok(&ws->utf8)) {
+                            pw_fail(aTHX_ ws, PW_CLOSE_INVALID_PAYLOAD,
+                                    "text is not utf8");
+                            goto consumed;
+                        }
+                        {
+                            SV *msg = whole
+                                ? newSVpvn(pn ? pl : "", pn)
+                                : newSVpvn(ws->fraglen ? ws->frag : "",
+                                           ws->fraglen);
+                            SV *a[1];
+                            if (is_text) SvUTF8_on(msg);
+                            a[0] = msg;
+                            ws->frag_active = 0;
+                            ws->fraglen     = 0;
+                            /* a large fragmented message leaves a large
+                             * buffer; give it back once it is handed on */
+                            if (ws->fragcap > PW_BUF_KEEP) {
+                                free(ws->frag);
+                                ws->frag = NULL; ws->fragcap = 0;
+                            }
+                            (void)pw_emit(aTHX_ ws,
+                                          is_text ? "message" : "binary", a, 1);
+                            /* Released here, not left to a temporaries
+                             * frame: this loop hands on every message a fast
+                             * sender has ready before it returns, and as
+                             * mortals they would all be alive at once. */
+                            SvREFCNT_dec(msg);
+                        }
+                    }
+                }
+            }
+        }
+        off += (size_t)n;
+    }
+consumed:
+    if (off && ws->rbuf) {
+        if (off < ws->rlen) memmove(ws->rbuf, ws->rbuf + off, ws->rlen - off);
+        ws->rlen -= off;
+        /* an empty read buffer that grew for one large message shrinks
+         * back, so an idle connection does not keep it for its whole life */
+        if (ws->rlen == 0 && ws->rcap > PW_BUF_KEEP) {
+            free(ws->rbuf);
+            ws->rbuf = NULL; ws->rcap = 0;
+        }
+    }
+    if (guard) SvREFCNT_dec(guard);
+}
+
+/* Bytes handed up by the server on an Extended CONNECT stream. The socket
+ * read loop's job, without the socket: append and let the codec run. */
+static void pw_feed(pTHX_ punk_wsconn *ws, const char *buf, size_t len,
+                    int fin) {
+    if (ws->state == PW_ST_CLOSED) return;
+    if (len) {
+        size_t cap = ws->max_message_size
+                   ? ws->max_message_size + PW_READ_CHUNK : 0;
+        if (cap && ws->rlen + len > cap) {
+            pw_fail(aTHX_ ws, PW_CLOSE_MESSAGE_TOO_BIG, "message too big");
+            return;
+        }
+        pw_buf_reserve(&ws->rbuf, &ws->rcap, ws->rlen + len);
+        memcpy(ws->rbuf + ws->rlen, buf, len);
+        ws->rlen += len;
+    }
+    pw_process(aTHX_ ws);
+    /* The peer half-closed its side of the stream: the same thing a read of
+     * zero means on a socket. */
+    if (fin && ws->state != PW_ST_CLOSED)
+        pw_teardown(aTHX_ ws, PW_CLOSE_ABNORMAL, NULL, 0);
+}
+
+/* The ABI's read half (v8) delivers here. */
+static void pw_on_stream_data_in(pTHX_ void *h, const char *buf, STRLEN len,
+                              int fin, void *ud) {
+    punk_wsconn *ws = (punk_wsconn *)ud;
+    PERL_UNUSED_ARG(h);
+    pw_feed(aTHX_ ws, buf, (size_t)len, fin);
+}
+
+static void pw_on_stream_data(pTHX_ void *h, const char *buf, STRLEN len,
+                              int fin, void *ud) {
+    punk_wsconn *ws_ = (punk_wsconn *)ud;
+    SV *keep = ws_->self_rv ? SvREFCNT_inc(ws_->self_rv) : NULL;
+    PK_LOOP_ENTER;
+    pw_on_stream_data_in(aTHX_ h, buf, len, fin, ud);
+    PK_LOOP_LEAVE;
+    if (keep) SvREFCNT_dec(keep);      /* ws may be gone after this */
+}
+
+/* The stream died under us - an h2 RST_STREAM, or the connection going. */
+static void pw_on_stream_abort_in(pTHX_ void *h, void *ud) {
+    punk_wsconn *ws = (punk_wsconn *)ud;
+    PERL_UNUSED_ARG(h);
+    if (ws->state != PW_ST_CLOSED)
+        pw_teardown(aTHX_ ws, PW_CLOSE_ABNORMAL, NULL, 0);
+}
+
+static void pw_on_stream_abort(pTHX_ void *h, void *ud) {
+    punk_wsconn *ws_ = (punk_wsconn *)ud;
+    SV *keep = ws_->self_rv ? SvREFCNT_inc(ws_->self_rv) : NULL;
+    PK_LOOP_ENTER;
+    pw_on_stream_abort_in(aTHX_ h, ud);
+    PK_LOOP_LEAVE;
+    if (keep) SvREFCNT_dec(keep);      /* ws may be gone after this */
+}
+
+/* How many reads one readiness callback may do before it hands the loop
+ * back. A peer that keeps its socket non-empty would otherwise be read and
+ * processed until it stopped, and every other connection and timer on the
+ * worker waited for it. The watcher is level-triggered, so what is left
+ * fires it again. */
+#define PW_READ_BUDGET 16
+
+static void pw_on_readable_in(pTHX_ int fd, int mask, void *ud) {
+    punk_wsconn *ws = (punk_wsconn *)ud;
+    int budget = PW_READ_BUDGET;
+    PERL_UNUSED_ARG(fd); PERL_UNUSED_ARG(mask);
+    for (;;) {
+        ssize_t n;
+        if (budget-- <= 0) return;
+        size_t cap = ws->max_message_size
+                   ? ws->max_message_size + PW_READ_CHUNK : 0;
+        if (cap && ws->rlen >= cap) {
+            pw_fail(aTHX_ ws, PW_CLOSE_MESSAGE_TOO_BIG, "message too big");
+            return;
+        }
+        pw_buf_reserve(&ws->rbuf, &ws->rcap, ws->rlen + PW_READ_CHUNK);
+        n = read(ws->fd, ws->rbuf + ws->rlen, PW_READ_CHUNK);
+        if (n > 0) {
+            /* Processed as it arrives, not once the socket runs dry. The cap
+             * above is on what is buffered, and buffering everything a fast
+             * sender had ready counted whole frames that only needed handing
+             * on: megabytes of small valid messages were closed as one
+             * message too big. */
+            ws->rlen += (size_t)n;
+            pw_process(aTHX_ ws);
+            if (ws->state == PW_ST_CLOSED || ws->fd < 0) return;
+            continue;
+        }
+        if (n == 0) {                       /* peer went away */
+            pw_teardown(aTHX_ ws, PW_CLOSE_ABNORMAL, NULL, 0);
+            return;
+        }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+        pw_teardown(aTHX_ ws, PW_CLOSE_ABNORMAL, NULL, 0);
+        return;
+    }
+}
+
+static void pw_on_readable(pTHX_ int fd, int mask, void *ud) {
+    punk_wsconn *ws_ = (punk_wsconn *)ud;
+    SV *keep = ws_->self_rv ? SvREFCNT_inc(ws_->self_rv) : NULL;
+    PK_LOOP_ENTER;
+    pw_on_readable_in(aTHX_ fd, mask, ud);
+    PK_LOOP_LEAVE;
+    if (keep) SvREFCNT_dec(keep);      /* ws may be gone after this */
+}
+
+/* ---- construction and destruction ---------------------------------------- */
+
+static punk_wsconn *pw_new(pTHX_ int fd, HV *opts) {
+    punk_wsconn *ws;
+    SV **e;
+    Newxz(ws, 1, punk_wsconn);
+    ws->fd    = fd;
+    ws->state = PW_ST_CONNECTING;
+    ws->cbs   = newHV();
+    ws->max_message_size   = PW_DEFAULT_MAX_MESSAGE;
+    ws->write_buffer_limit = PW_DEFAULT_WRITE_LIMIT;
+    pw_utf8_reset(&ws->utf8);
+    if (opts) {
+        /* zero keeps the default: it used to mean no bound at all, and a
+         * connection with no bound could grow the worker without limit */
+        if ((e = hv_fetchs(opts, "max_message_size", 0)) && *e && SvOK(*e)
+            && SvUV(*e))
+            ws->max_message_size = (size_t)SvUV(*e);
+        if ((e = hv_fetchs(opts, "write_buffer_limit", 0)) && *e && SvOK(*e))
+            ws->write_buffer_limit = (size_t)SvUV(*e);
+        if ((e = hv_fetchs(opts, "protocol", 0)) && *e && SvOK(*e))
+            ws->protocol = newSVsv(*e);
+        if ((e = hv_fetchs(opts, "blocking", 0)) && *e && SvTRUE(*e))
+            ws->blocking = 1;
+    }
+    return ws;
+}
+
+/* The blessed IV-ref -> the struct, guarded like Punk::Router's handles. */
+static punk_wsconn *punk_ws_of(pTHX_ SV *self) {
+    if (!SvROK(self) || !SvIOK(SvRV(self)))
+        croak("Punk::WebSocket: not a connection");
+    return (punk_wsconn *)INT2PTR(void *, SvIV(SvRV(self)));
+}
+
+static void pw_free(pTHX_ punk_wsconn *ws) {
+    if (!ws) return;
+    if (ws->fd >= 0) close(ws->fd);
+    if (ws->cbs)         SvREFCNT_dec((SV *)ws->cbs);
+    if (ws->protocol)    SvREFCNT_dec(ws->protocol);
+    if (ws->peer_reason) SvREFCNT_dec(ws->peer_reason);
+    if (ws->rbuf) free(ws->rbuf);
+    if (ws->wbuf) free(ws->wbuf);
+    if (ws->frag) free(ws->frag);
+    Safefree(ws);
+}
+
+#endif /* PUNK_WSCONN_H */
